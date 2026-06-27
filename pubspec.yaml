@@ -1,0 +1,47 @@
+name: ar_jewelry_app
+description: Application Flutter d'essayage de bijoux en réalité augmentée temps réel.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+
+  # Caméra temps réel (>= 0.12 requis par hand_landmarker 3.x)
+  camera: ^0.12.0+1
+
+  # Détection main (MediaPipe wrapper) — API stream-based depuis 3.x
+  hand_landmarker: ^3.0.0
+
+  # Détection visage (Google ML Kit) — utilisé pour colliers/boucles/perles
+  google_mlkit_face_detection: ^0.10.1
+
+  # Rendu 3D des fichiers .glb superposés à la caméra
+  model_viewer_plus: ^1.7.1
+
+  # Permissions runtime
+  permission_handler: ^11.3.1
+
+  # Utilitaires
+  path_provider: ^2.1.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.2
+
+flutter:
+  uses-material-design: true
+
+  # Déclaration des sous-dossiers d'assets (1 par type de bijou)
+  assets:
+    - assets/jewelry/bagues/
+    - assets/jewelry/colliers/
+    - assets/jewelry/boucles/
+    - assets/jewelry/bracelets/
+    - assets/jewelry/perles/
