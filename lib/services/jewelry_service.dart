@@ -41,8 +41,16 @@ class JewelryService {
     final AssetManifest manifest =
         await AssetManifest.loadFromAssetBundle(rootBundle);
 
+    _filesByFolder = groupAssetPaths(manifest.listAssets());
+  }
+
+  /// Regroupe les chemins d'assets `.glb` sous `assets/jewelry/<folder>/` par
+  /// sous-dossier, en ignorant tout le reste. Fonction pure (sans bundle) pour
+  /// être testable — cf. test/jewelry_service_test.dart.
+  @visibleForTesting
+  static Map<String, List<String>> groupAssetPaths(Iterable<String> paths) {
     final Map<String, List<String>> grouped = <String, List<String>>{};
-    for (final String path in manifest.listAssets()) {
+    for (final String path in paths) {
       if (!path.startsWith('assets/jewelry/')) continue;
       if (!path.toLowerCase().endsWith('.glb')) continue;
 
@@ -57,7 +65,7 @@ class JewelryService {
     for (final List<String> list in grouped.values) {
       list.sort();
     }
-    _filesByFolder = grouped;
+    return grouped;
   }
 
   /// Retourne la liste des types disponibles (un par sous-dossier non vide).
@@ -84,19 +92,22 @@ class JewelryService {
         _filesByFolder![type.folder] ?? const <String>[];
     return paths
         .map((String p) => JewelryModel(
-              name: _fileNameToTitle(p),
+              name: fileNameToTitle(p),
               assetPath: p,
               type: type,
             ))
         .toList(growable: false);
   }
 
-  // --- helpers privés -----------------------------------------------------
+  // --- helpers -----------------------------------------------------------
 
   String _prettify(String folder) =>
       folder.isEmpty ? folder : folder[0].toUpperCase() + folder.substring(1);
 
-  String _fileNameToTitle(String assetPath) {
+  /// Dérive un libellé présentable du nom de fichier d'un `.glb`
+  /// (ex: "anneau_or.glb" -> "Anneau or"). Pur / testable.
+  @visibleForTesting
+  static String fileNameToTitle(String assetPath) {
     final String file = assetPath.split('/').last;
     final String noExt =
         file.toLowerCase().endsWith('.glb') ? file.substring(0, file.length - 4) : file;
