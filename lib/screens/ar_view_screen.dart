@@ -2,13 +2,13 @@ import 'dart:async';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../config/tracking_config.dart';
 import '../main.dart' show cameras;
 import '../models/jewelry_model.dart';
 import '../services/ar_service.dart';
+import '../widgets/ar_overlay_view.dart';
 import '../widgets/fps_counter.dart';
 import '../widgets/loading_indicator.dart';
 
@@ -233,76 +233,29 @@ class _ARViewScreenState extends State<ARViewScreen>
       return const CenteredLoader(label: 'Préparation de la caméra…');
     }
 
-    // Aperçu caméra + overlay 3D positionné par ValueListenableBuilder.
-    return LayoutBuilder(
-      builder: (BuildContext _, BoxConstraints box) {
-        return Stack(
-          fit: StackFit.expand,
-          children: <Widget>[
-            // Centrage + ratio caméra pour éviter les déformations.
-            Center(
-              child: AspectRatio(
-                aspectRatio: _cam!.value.aspectRatio,
-                child: CameraPreview(_cam!),
-              ),
-            ),
-            ValueListenableBuilder<AnchorResult?>(
-              valueListenable: _anchor,
-              builder: (BuildContext _, AnchorResult? r, __) {
-                if (r == null) {
-                  return const SizedBox.shrink();
-                }
-                // Le bijou occupe une fraction de la dimension la plus
-                // petite (scale est normalisé à la frame caméra).
-                final double side =
-                    box.maxWidth.clamp(0, double.infinity) * r.scale;
-                final double left =
-                    r.position.dx * box.maxWidth - side / 2;
-                final double top =
-                    r.position.dy * box.maxHeight - side / 2;
-                return Positioned(
-                  left: left,
-                  top: top,
-                  width: side,
-                  height: side,
-                  child: IgnorePointer(
-                    child: Transform.rotate(
-                      angle: r.rotationRadians,
-                      child: _JewelryGlbView(
-                        assetPath: widget.jewelry.assetPath,
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-/// Affichage d'un .glb via model_viewer_plus, fond transparent.
-/// Mémoïsé via un widget dédié pour éviter de recréer la WebView
-/// à chaque update du Positioned parent.
-class _JewelryGlbView extends StatelessWidget {
-  final String assetPath;
-  const _JewelryGlbView({required this.assetPath});
-
-  @override
-  Widget build(BuildContext context) {
-    return ModelViewer(
-      key: ValueKey<String>(assetPath),
-      src: assetPath, // chemin asset Flutter, model_viewer_plus l'expose en local
-      alt: 'Bijou 3D',
-      ar: false,
-      autoRotate: false,
-      disableZoom: true,
-      cameraControls: false,
-      backgroundColor: const Color(0x00000000),
-      // 'reveal: manual' évite l'animation d'apparition à chaque rebuild.
-      relatedCss: 'model-viewer { background-color: transparent; }',
+    // Aperçu caméra en fond + overlay three.js plein écran (transparent).
+    // L'overlay n'est PAS recréé à chaque frame : la scène three.js interne
+    // repositionne le bijou en continu à partir du ValueListenable [_anchor].
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        // Centrage + ratio caméra pour éviter les déformations.
+        Center(
+          child: AspectRatio(
+            aspectRatio: _cam!.value.aspectRatio,
+            child: CameraPreview(_cam!),
+          ),
+        ),
+        IgnorePointer(
+          child: AROverlayView(
+            anchor: _anchor,
+            assetPath: widget.jewelry.assetPath,
+            // Prototype de validation : sphère PBR dorée ancrée sur le repère.
+            // Passer à `false` pour afficher les vrais .glb.
+            prototypeSphere: true,
+          ),
+        ),
+      ],
     );
   }
 }

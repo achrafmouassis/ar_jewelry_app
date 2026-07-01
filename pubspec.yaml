@@ -21,8 +21,9 @@ dependencies:
   # Détection visage (Google ML Kit) — utilisé pour colliers/boucles/perles
   google_mlkit_face_detection: ^0.10.1
 
-  # Rendu 3D des fichiers .glb superposés à la caméra
-  model_viewer_plus: ^1.7.1
+  # Rendu 3D temps réel : WebView hébergeant une scène three.js custom
+  # (PBR + ancrage des .glb sur les landmarks). Voir docs/decision_rendu_3d.md.
+  webview_flutter: ^4.7.0
 
   # Permissions runtime
   permission_handler: ^11.3.1
@@ -45,3 +46,6 @@ flutter:
     - assets/jewelry/boucles/
     - assets/jewelry/bracelets/
     - assets/jewelry/perles/
+    # Scène de rendu AR (three.js bundlé localement + page HTML overlay)
+    - assets/web/
+    - assets/web/three/

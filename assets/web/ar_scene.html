@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent; /* overlay transparent au-dessus du flux caméra Flutter */
+    }
+    #c { display: block; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <!-- three.js + loaders bundlés localement : AUCUNE requête réseau à l'exécution -->
+  <script src="three/three.min.js"></script>
+  <script src="three/GLTFLoader.js"></script>
+  <script src="three/RoomEnvironment.js"></script>
+
+  <script>
+  /*
+   * Scène AR overlay.
+   *
+   * Repère : caméra orthographique en espace PIXELS, origine en haut-gauche
+   * (y vers le bas), pour coller exactement aux coordonnées normalisées de
+   * l'AnchorResult Dart (x,y in [0..1] de la frame caméra).
+   *
+   * API pilotée par Flutter :
+   *   arSetModel(url)                 -> charge un .glb ('sphere' = prototype PBR)
+   *   arUpdate(x, y, scale, rot, vis) -> transforme l'objet à chaque frame
+   *
+   * Remontées vers Flutter via le canal JS 'ARChannel' :
+   *   {type:'ready'} {type:'loaded'} {type:'error', message} {type:'fps', value}
+   */
+  (function () {
+    'use strict';
+
+    var canvas = document.getElementById('c');
+    var renderer, scene, camera, envMap, object = null, currentUrl = null;
+
+    // État d'ancrage courant (mis à jour par arUpdate, appliqué dans la boucle rAF).
+    var anchor = { x: 0.5, y: 0.5, scale: 0.2, rot: 0.0, visible: false };
+
+    var W = 1, H = 1, DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+    function post(msg) {
+      try {
+        if (window.ARChannel && window.ARChannel.postMessage) {
+          window.ARChannel.postMessage(JSON.stringify(msg));
+        }
+      } catch (e) {}
+    }
+
+    function resize() {
+      W = window.innerWidth;
+      H = window.innerHeight;
+      renderer.setPixelRatio(DPR);
+      renderer.setSize(W, H, false);
+      // Ortho en pixels, y vers le bas : (left, right, top, bottom, near, far).
+      camera.left = 0; camera.right = W;
+      camera.top = 0;  camera.bottom = H;
+      camera.near = -2000; camera.far = 2000;
+      camera.updateProjectionMatrix();
+    }
+
+    function init() {
+      renderer = new THREE.WebGLRenderer({
+        canvas: canvas,
+        antialias: true,
+        alpha: true,            // fond transparent
+        premultipliedAlpha: false
+      });
+      renderer.setClearColor(0x000000, 0);
+      renderer.outputEncoding = THREE.sRGBEncoding;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.1;
+
+      scene = new THREE.Scene();
+
+      camera = new THREE.OrthographicCamera(0, 1, 0, 1, -2000, 2000);
+      camera.position.set(0, 0, 1000);
+      camera.lookAt(0, 0, 0);
+
+      // Environnement PBR : reflets métalliques crédibles sans fichier HDR.
+      var pmrem = new THREE.PMREMGenerator(renderer);
+      envMap = pmrem.fromScene(new THREE.RoomEnvironment(), 0.04).texture;
+      scene.environment = envMap;
+
+      // Lumières d'appoint (l'env map fait l'essentiel du travail).
+      var hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 0.6);
+      scene.add(hemi);
+      var dir = new THREE.DirectionalLight(0xffffff, 1.1);
+      dir.position.set(0.5, -1, 1); // -y = vers le haut de l'écran (repère y-down)
+      scene.add(dir);
+
+      resize();
+      window.addEventListener('resize', resize);
+
+      post({ type: 'ready' });
+      animate();
+    }
+
+    // Normalise un objet chargé : centré à l'origine, diamètre ~1 unité,
+    // pour que l'échelle en pixels soit pilotable simplement.
+    function normalize(root) {
+      var box = new THREE.Box3().setFromObject(root);
+      var size = new THREE.Vector3();
+      var center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+      var maxDim = Math.max(size.x, size.y, size.z) || 1;
+      var g = new THREE.Group();
+      root.position.sub(center);       // recentre
+      g.add(root);
+      g.scale.setScalar(1 / maxDim);   // diamètre ~1
+      return g;
+    }
+
+    function clearObject() {
+      if (object) { scene.remove(object); object = null; }
+    }
+
+    // Sphère PBR dorée — prototype de validation de l'approche de rendu.
+    function makeSphere() {
+      var geo = new THREE.SphereGeometry(0.5, 48, 48);
+      var mat = new THREE.MeshStandardMaterial({
+        color: 0xD4AF37,     // or
+        metalness: 1.0,
+        roughness: 0.25,
+        envMapIntensity: 1.2
+      });
+      var mesh = new THREE.Mesh(geo, mat);
+      var g = new THREE.Group();
+      g.add(mesh);
+      return g;
+    }
+
+    window.arSetModel = function (url) {
+      if (url === currentUrl) return;
+      currentUrl = url;
+      clearObject();
+
+      if (!url || url === 'sphere') {
+        object = makeSphere();
+        scene.add(object);
+        post({ type: 'loaded' });
+        return;
+      }
+
+      var loader = new THREE.GLTFLoader();
+      loader.load(
+        url,
+        function (gltf) {
+          clearObject();
+          object = normalize(gltf.scene);
+          scene.add(object);
+          post({ type: 'loaded' });
+        },
+        undefined,
+        function (err) {
+          post({ type: 'error', message: '' + (err && err.message ? err.message : err) });
+        }
+      );
+    };
+
+    window.arUpdate = function (x, y, scale, rot, visible) {
+      anchor.x = x; anchor.y = y; anchor.scale = scale;
+      anchor.rot = rot; anchor.visible = !!visible;
+    };
+
+    // Compteur FPS interne (remonté périodiquement vers Flutter, diagnostic).
+    var frames = 0, lastFpsT = performance.now();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (object) {
+        object.visible = anchor.visible;
+        if (anchor.visible) {
+          // Position en pixels (origine haut-gauche).
+          object.position.set(anchor.x * W, anchor.y * H, 0);
+          // Échelle uniforme : diamètre pixel ≈ scale * largeur écran.
+          var s = Math.max(anchor.scale * W, 1);
+          object.scale.setScalar(s);
+          // Rotation de roulis autour de l'axe de vue.
+          object.rotation.z = anchor.rot;
+        }
+      }
+
+      renderer.render(scene, camera);
+
+      frames++;
+      var now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        post({ type: 'fps', value: Math.round(frames * 1000 / (now - lastFpsT)) });
+        frames = 0; lastFpsT = now;
+      }
+    }
+
+    if (typeof THREE === 'undefined') {
+      post({ type: 'error', message: 'three.js non chargé' });
+    } else {
+      init();
+    }
+  })();
+  </script>
+</body>
+</html>
