@@ -18,8 +18,9 @@ dependencies:
   # Détection main (MediaPipe wrapper) — API stream-based depuis 3.x
   hand_landmarker: ^3.0.0
 
-  # Détection visage (Google ML Kit) — utilisé pour colliers/boucles/perles
-  google_mlkit_face_detection: ^0.10.1
+  # Détection visage — FaceMesh 468 points (topologie MediaPipe via ML Kit),
+  # requis pour un ancrage précis colliers/boucles/perles.
+  google_mlkit_face_mesh_detection: ^0.3.0
 
   # Rendu 3D temps réel : WebView hébergeant une scène three.js custom
   # (PBR + ancrage des .glb sur les landmarks). Voir docs/decision_rendu_3d.md.

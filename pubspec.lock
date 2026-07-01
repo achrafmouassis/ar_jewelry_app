@@ -172,18 +172,18 @@ packages:
     dependency: transitive
     description:
       name: google_mlkit_commons
-      sha256: "27d626c66a181351a953eba5b6ff1ff123aadb891b4dab085b292118f039d6ac"
+      sha256: "7e9a6d6e66b44aa8cfe944bda9bc3346c52486dd890ca49e5bc98845cda40d7f"
       url: "https://pub.dev"
     source: hosted
-    version: "0.7.1"
-  google_mlkit_face_detection:
+    version: "0.9.0"
+  google_mlkit_face_mesh_detection:
     dependency: "direct main"
     description:
-      name: google_mlkit_face_detection
-      sha256: cc2e2d2f4ddbedcb5cc089e6dab2ba8265b4fed72a85eb3bcebc2e20a53281e7
+      name: google_mlkit_face_mesh_detection
+      sha256: aa2659c03f46cf69510a998e0bd14f23b9d3c7b0c9b1fe1050656ad80d6e24bd
       url: "https://pub.dev"
     source: hosted
-    version: "0.10.1"
+    version: "0.3.0"
   hand_landmarker:
     dependency: "direct main"
     description:

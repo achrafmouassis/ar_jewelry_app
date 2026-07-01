@@ -48,7 +48,7 @@
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
 
-    <!-- Autorisation chargement local (model_viewer_plus utilise une WebView) -->
+    <!-- Autorisation chargement local (overlay AR three.js via webview_flutter) -->
     <key>io.flutter.embedded_views_preview</key>
     <true/>
     <key>NSAppTransportSecurity</key>

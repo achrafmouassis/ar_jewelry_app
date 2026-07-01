@@ -48,3 +48,40 @@ class TrackingConfig {
   static CameraLensDirection lensFor(String folder) =>
       CameraLensDirection.front;
 }
+
+/// Indices de landmarks du **FaceMesh MediaPipe (468 points)**, tels que
+/// renvoyés par `google_mlkit_face_mesh_detection`.
+///
+/// Références de la topologie canonique FaceMesh :
+///  - 10  : haut du front (ligne de cheveux, centre) → diadèmes/perles
+///  - 152 : pointe du menton → extrapolation base du cou (colliers)
+///  - 234 : oreille droite (côté image), 454 : oreille gauche → boucles
+///  - 33  : coin externe œil droit, 263 : coin externe œil gauche → roulis
+///  - 1   : pointe du nez → repli centre visage
+class FaceMeshIndices {
+  const FaceMeshIndices._();
+
+  static const int foreheadTop = 10;
+  static const int chin = 152;
+  static const int rightEar = 234;
+  static const int leftEar = 454;
+  static const int rightEyeOuter = 33;
+  static const int leftEyeOuter = 263;
+  static const int noseTip = 1;
+
+  /// Landmark de base pour un point d'ancrage visage donné. Certaines cibles
+  /// (cou) partent de ce point puis extrapolent (cf. ARService).
+  static int baseFor(AnchorPoint anchor) {
+    switch (anchor) {
+      case AnchorPoint.ear:
+        return leftEar; // boucle sur l'oreille gauche (côté écran en miroir)
+      case AnchorPoint.neck:
+        return chin; // point de départ, on descend ensuite vers le cou
+      case AnchorPoint.forehead:
+        return foreheadTop;
+      case AnchorPoint.ringFinger:
+      case AnchorPoint.wrist:
+        return noseTip; // cibles main : non utilisé côté visage
+    }
+  }
+}

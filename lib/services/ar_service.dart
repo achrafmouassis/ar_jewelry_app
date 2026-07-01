@@ -1,13 +1,14 @@
 import 'dart:async';
-import 'dart:math' as math;
 import 'dart:ui' show Offset, Size;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:google_mlkit_face_mesh_detection/google_mlkit_face_mesh_detection.dart';
 import 'package:hand_landmarker/hand_landmarker.dart';
 
 import '../config/tracking_config.dart';
+import 'anchor_math.dart';
+import 'one_euro_filter.dart';
 
 /// Résultat d'une détection : position du point d'ancrage en coordonnées
 /// normalisées [0..1] de la frame caméra **redressée** (origine en haut-gauche,
@@ -26,17 +27,17 @@ class AnchorResult {
   });
 }
 
-/// Service AR : encapsule MediaPipe Hand Landmarker (main) et ML Kit
-/// Face Detection (visage), et expose un flux unifié [AnchorResult].
+/// Service AR : encapsule MediaPipe Hand Landmarker (main, 21 pts) et
+/// **MediaPipe FaceMesh via ML Kit** (visage, 468 pts), et expose un flux
+/// unifié [AnchorResult].
 ///
 /// Points perf :
-/// - MediaPipe en delegate GPU (configurable côté plugin).
-/// - Hand Landmarker est asynchrone : on lui pousse les frames via
-///   `processFrame`, et on consomme les résultats via `landmarkStream`.
-/// - ML Kit est appelé manuellement avec un garde `_busy` (throttle) pour
+/// - MediaPipe main en delegate GPU, asynchrone : on pousse les frames via
+///   `processFrame`, les résultats arrivent par `landmarkStream`.
+/// - FaceMesh est appelé manuellement avec un garde `_busy` (throttle) pour
 ///   ne pas accumuler de frames en queue.
-/// - Les positions sont lissées par un filtre One-Euro pour éliminer le
-///   tremblement frame-à-frame (perçu comme un overlay "qui vibre").
+/// - Les positions sont lissées par un filtre One-Euro ([AnchorSmoother]) pour
+///   éliminer le tremblement frame-à-frame.
 /// - `dispose()` obligatoire à la fermeture de l'écran.
 class ARService {
   final TrackingTarget target;
@@ -47,14 +48,14 @@ class ARService {
   final bool mirror;
 
   HandLandmarkerPlugin? _hand;
-  FaceDetector? _face;
+  FaceMeshDetector? _faceMesh;
   StreamSubscription<List<Hand>>? _handSub;
 
   bool _busy = false; // throttle pour le pipeline visage
   bool _disposed = false;
 
   // Lissage des sorties (anti-jitter).
-  final _AnchorSmoother _smoother = _AnchorSmoother();
+  final AnchorSmoother _smoother = AnchorSmoother();
 
   final StreamController<AnchorResult?> _controller =
       StreamController<AnchorResult?>.broadcast();
@@ -77,29 +78,16 @@ class ARService {
         minHandDetectionConfidence: 0.5,
         delegate: HandLandmarkerDelegate.gpu,
       );
-
-      // Abonnement au flux de détections : on traduit chaque détection
-      // en AnchorResult et on la pousse dans notre StreamController.
       _handSub = _hand!.landmarkStream.listen(_onHands);
     } else {
-      // ML Kit Face Detector — mode fast + landmarks (oreilles, nez, bouche).
-      _face = FaceDetector(
-        options: FaceDetectorOptions(
-          enableLandmarks: true,
-          enableContours: false,
-          enableClassification: false,
-          enableTracking: true,
-          performanceMode: FaceDetectorMode.fast,
-          minFaceSize: 0.15,
-        ),
-      );
+      // ML Kit FaceMesh — 468 landmarks (topologie canonique MediaPipe).
+      _faceMesh = FaceMeshDetector(option: FaceMeshDetectorOptions.faceMesh);
     }
   }
 
   /// Traite une frame caméra.
-  /// - Main : fire-and-forget vers MediaPipe ; les résultats arrivent
-  ///   asynchronement par le stream.
-  /// - Visage : appel ML Kit manuel avec garde anti-backlog.
+  /// - Main : fire-and-forget vers MediaPipe ; résultats via le stream.
+  /// - Visage : appel FaceMesh manuel avec garde anti-backlog.
   void processFrame(CameraImage image, CameraDescription camera) {
     if (_disposed) return;
     if (target == TrackingTarget.hand) {
@@ -119,7 +107,18 @@ class ARService {
       _controller.add(null);
       return;
     }
-    _controller.add(_smoother.apply(raw));
+    final int t = DateTime.now().millisecondsSinceEpoch;
+    final ({Offset position, double scale, double rotation}) s = _smoother.apply(
+      position: raw.position,
+      scale: raw.scale,
+      rotation: raw.rotationRadians,
+      tMs: t,
+    );
+    _controller.add(AnchorResult(
+      position: s.position,
+      scale: s.scale,
+      rotationRadians: s.rotation,
+    ));
   }
 
   // --- MAIN --------------------------------------------------------------
@@ -138,127 +137,98 @@ class ARService {
     }
 
     // Indices standards MediaPipe Hand :
-    //  0  = wrist
-    //  9  = base du majeur (middle finger MCP) — repère d'échelle
-    //  13 = base de l'annulaire (ring finger MCP)
-    //  14 = phalange intermédiaire de l'annulaire (ring finger PIP)
-    final double tx, ty;
-    if (anchor == AnchorPoint.wrist) {
-      tx = lm[0].x;
-      ty = lm[0].y;
-    } else {
-      // milieu entre 13 et 14 → emplacement naturel d'une bague
-      tx = (lm[13].x + lm[14].x) / 2;
-      ty = (lm[13].y + lm[14].y) / 2;
-    }
+    //  0  = wrist ; 9 = base du majeur (échelle) ; 13/14 = annulaire.
+    final Offset wrist = Offset(lm[0].x, lm[0].y);
+    final Offset middleMcp = Offset(lm[9].x, lm[9].y);
 
-    // Échelle = distance euclidienne entre poignet (0) et MCP majeur (9).
-    final double dx = lm[9].x - lm[0].x;
-    final double dy = lm[9].y - lm[0].y;
-    final double handSize = math.sqrt(dx * dx + dy * dy);
+    final Offset target = anchor == AnchorPoint.wrist
+        ? wrist
+        : AnchorMath.midpoint(
+            Offset(lm[13].x, lm[13].y), Offset(lm[14].x, lm[14].y));
 
-    final double px = mirror ? 1.0 - tx : tx;
+    final double handSize = AnchorMath.distance(middleMcp, wrist);
+    final double px = AnchorMath.mirrorX(target.dx, mirror);
+
     _emit(AnchorResult(
-      position: Offset(px.clamp(0.0, 1.0), ty.clamp(0.0, 1.0)),
+      position: AnchorMath.clampToFrame(Offset(px, target.dy)),
       scale: (handSize * 0.6).clamp(0.05, 0.5),
     ));
   }
 
-  // --- VISAGE ------------------------------------------------------------
+  // --- VISAGE (FaceMesh 468) --------------------------------------------
 
   Future<void> _processFace(CameraImage image, CameraDescription cam) async {
-    final FaceDetector? det = _face;
+    final FaceMeshDetector? det = _faceMesh;
     if (det == null) return;
 
     final InputImage? input = _toInputImage(image, cam);
     if (input == null) return;
 
     try {
-      final List<Face> faces = await det.processImage(input);
+      final List<FaceMesh> meshes = await det.processImage(input);
       if (_disposed) return;
 
-      if (faces.isEmpty) {
+      if (meshes.isEmpty) {
         _emit(null);
         return;
       }
 
-      final Face face = faces.first;
+      final FaceMesh mesh = meshes.first;
+      final List<FaceMeshPoint> pts = mesh.points;
+      if (pts.length < 468) {
+        _emit(null);
+        return;
+      }
 
-      // ML Kit renvoie les coordonnées dans l'espace de l'image **redressée**
-      // (rotation appliquée). Pour une rotation de 90/270°, les dimensions
-      // utiles sont donc inversées par rapport au buffer brut.
+      // FaceMesh renvoie les coordonnées dans l'espace de l'image **redressée**.
+      // Pour 90/270°, les dimensions utiles sont inversées vs le buffer brut.
       final bool rotated =
           cam.sensorOrientation == 90 || cam.sensorOrientation == 270;
-      final double w =
-          (rotated ? image.height : image.width).toDouble();
-      final double h =
-          (rotated ? image.width : image.height).toDouble();
+      final double w = (rotated ? image.height : image.width).toDouble();
+      final double h = (rotated ? image.width : image.height).toDouble();
 
-      Offset? pos;
-      switch (anchor) {
-        case AnchorPoint.ear:
-          final FaceLandmark? leftEar =
-              face.landmarks[FaceLandmarkType.leftEar];
-          if (leftEar != null) {
-            pos = Offset(
-              leftEar.position.x.toDouble() / w,
-              leftEar.position.y.toDouble() / h,
-            );
-          }
-          break;
-        case AnchorPoint.neck:
-          // ML Kit n'a pas de landmark "cou" : on prend la bouche et on
-          // descend de ~40% de la hauteur du visage.
-          final FaceLandmark? mouth =
-              face.landmarks[FaceLandmarkType.bottomMouth];
-          if (mouth != null) {
-            pos = Offset(
-              mouth.position.x.toDouble() / w,
-              (mouth.position.y.toDouble() + face.boundingBox.height * 0.4) / h,
-            );
-          }
-          break;
-        case AnchorPoint.forehead:
-          final FaceLandmark? nose =
-              face.landmarks[FaceLandmarkType.noseBase];
-          if (nose != null) {
-            pos = Offset(
-              nose.position.x.toDouble() / w,
-              (nose.position.y.toDouble() - face.boundingBox.height * 0.45) / h,
-            );
-          }
-          break;
-        default:
-          pos = Offset(
-            (face.boundingBox.left + face.boundingBox.width / 2) / w,
-            (face.boundingBox.top + face.boundingBox.height / 2) / h,
-          );
+      Offset pix(int i) => Offset(pts[i].x.toDouble(), pts[i].y.toDouble());
+
+      // Point d'ancrage de base selon le type de bijou.
+      Offset anchorPix = pix(FaceMeshIndices.baseFor(anchor));
+
+      // Cou : pas de landmark dédié → on descend depuis le menton d'une
+      // fraction de la hauteur du visage pour viser la base du cou.
+      if (anchor == AnchorPoint.neck) {
+        anchorPix =
+            Offset(anchorPix.dx, anchorPix.dy + mesh.boundingBox.height * 0.5);
       }
 
-      if (pos == null) {
-        _emit(null);
-        return;
-      }
+      final Offset pos = AnchorMath.normalize(anchorPix, w, h);
 
-      // Miroir horizontal pour la caméra frontale.
-      final double px = mirror ? 1.0 - pos.dx : pos.dx;
-      final double faceSize = face.boundingBox.width / w;
-      final double roll = (face.headEulerAngleZ ?? 0) * math.pi / 180.0;
+      // Échelle : largeur du visage (oreille à oreille), normalisée.
+      final double faceW = AnchorMath.distance(
+            pix(FaceMeshIndices.rightEar),
+            pix(FaceMeshIndices.leftEar),
+          ) /
+          w;
 
+      // Roulis : angle entre les coins externes des yeux (espace pixel).
+      final double roll = AnchorMath.rollRadians(
+        pix(FaceMeshIndices.rightEyeOuter),
+        pix(FaceMeshIndices.leftEyeOuter),
+      );
+
+      final double px = AnchorMath.mirrorX(pos.dx, mirror);
       _emit(AnchorResult(
-        position: Offset(px.clamp(0.0, 1.0), pos.dy.clamp(0.0, 1.0)),
-        scale: (faceSize * 0.9).clamp(0.05, 0.6),
+        position: AnchorMath.clampToFrame(Offset(px, pos.dy)),
+        scale: (faceW * 0.9).clamp(0.05, 0.6),
         rotationRadians: mirror ? -roll : roll,
       ));
     } catch (e) {
-      debugPrint('AR face error: $e');
+      debugPrint('AR face mesh error: $e');
     }
   }
 
   /// Construit l'InputImage attendu par ML Kit à partir du CameraImage.
   ///
   /// Le controller caméra est configuré en **NV21** pour la cible visage :
-  /// l'image tient donc dans un seul plan exploitable directement, sans
+  /// l'image tient dans un seul plan exploitable directement, sans
   /// concaténation manuelle (qui produirait un buffer invalide pour ML Kit).
   InputImage? _toInputImage(CameraImage img, CameraDescription cam) {
     final Plane plane = img.planes.first;
@@ -289,88 +259,7 @@ class ARService {
     await _controller.close();
     _hand?.dispose();
     _hand = null;
-    await _face?.close();
-    _face = null;
-  }
-}
-
-/// Lissage One-Euro appliqué aux 4 grandeurs d'un [AnchorResult]
-/// (x, y, échelle, rotation). Réduit fortement le jitter tout en gardant
-/// une bonne réactivité lors des mouvements rapides.
-class _AnchorSmoother {
-  final _OneEuroFilter _x = _OneEuroFilter(minCutoff: 1.2, beta: 0.02);
-  final _OneEuroFilter _y = _OneEuroFilter(minCutoff: 1.2, beta: 0.02);
-  final _OneEuroFilter _scale = _OneEuroFilter(minCutoff: 0.8, beta: 0.01);
-  final _OneEuroFilter _rot = _OneEuroFilter(minCutoff: 1.0, beta: 0.01);
-
-  AnchorResult apply(AnchorResult r) {
-    final int t = DateTime.now().millisecondsSinceEpoch;
-    return AnchorResult(
-      position: Offset(_x.filter(r.position.dx, t), _y.filter(r.position.dy, t)),
-      scale: _scale.filter(r.scale, t),
-      rotationRadians: _rot.filter(r.rotationRadians, t),
-    );
-  }
-
-  void reset() {
-    _x.reset();
-    _y.reset();
-    _scale.reset();
-    _rot.reset();
-  }
-}
-
-/// Filtre One-Euro (Casiez et al., 2012).
-/// Faible latence à faible vitesse (lisse le bruit), faible lissage à
-/// haute vitesse (suit le mouvement) — idéal pour du tracking AR.
-class _OneEuroFilter {
-  final double minCutoff;
-  final double beta;
-
-  // Fréquence de coupure du dérivé : 1 Hz est la valeur usuelle du papier.
-  static const double dCutoff = 1.0;
-
-  double? _xPrev;
-  double? _dxPrev;
-  int? _tPrev; // ms
-
-  _OneEuroFilter({
-    this.minCutoff = 1.0,
-    this.beta = 0.0,
-  });
-
-  double _alpha(double cutoff, double dt) {
-    final double tau = 1.0 / (2 * math.pi * cutoff);
-    return 1.0 / (1.0 + tau / dt);
-  }
-
-  double filter(double x, int tMs) {
-    if (_tPrev == null) {
-      _tPrev = tMs;
-      _xPrev = x;
-      _dxPrev = 0.0;
-      return x;
-    }
-
-    double dt = (tMs - _tPrev!) / 1000.0;
-    if (dt <= 0) dt = 1.0 / 30.0; // garde-fou
-    _tPrev = tMs;
-
-    final double dx = (x - _xPrev!) / dt;
-    final double edx =
-        _alpha(dCutoff, dt) * dx + (1 - _alpha(dCutoff, dt)) * _dxPrev!;
-    _dxPrev = edx;
-
-    final double cutoff = minCutoff + beta * edx.abs();
-    final double a = _alpha(cutoff, dt);
-    final double ex = a * x + (1 - a) * _xPrev!;
-    _xPrev = ex;
-    return ex;
-  }
-
-  void reset() {
-    _xPrev = null;
-    _dxPrev = null;
-    _tPrev = null;
+    await _faceMesh?.close();
+    _faceMesh = null;
   }
 }
