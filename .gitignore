@@ -36,3 +36,7 @@ Thumbs.db
 
 # Java heap dumps
 *.hprof
+
+# Node (outillage scripts d'optimisation d'assets — non versionné)
+node_modules/
+package-lock.json

@@ -21,6 +21,7 @@
   <!-- three.js + loaders bundlés localement : AUCUNE requête réseau à l'exécution -->
   <script src="three/three.min.js"></script>
   <script src="three/GLTFLoader.js"></script>
+  <script src="three/DRACOLoader.js"></script>
   <script src="three/RoomEnvironment.js"></script>
 
   <script>
@@ -43,6 +44,7 @@
 
     var canvas = document.getElementById('c');
     var renderer, scene, camera, envMap, object = null, currentUrl = null;
+    var gltfLoader = null; // GLTFLoader + DRACOLoader, créés une fois
 
     // État d'ancrage courant (mis à jour par arUpdate, appliqué dans la boucle rAF).
     var anchor = { x: 0.5, y: 0.5, scale: 0.2, rot: 0.0, visible: false };
@@ -99,6 +101,13 @@
       dir.position.set(0.5, -1, 1); // -y = vers le haut de l'écran (repère y-down)
       scene.add(dir);
 
+      // GLTFLoader avec décodeur Draco (les .glb sont compressés Draco).
+      // Décodeur bundlé localement dans three/draco/.
+      gltfLoader = new THREE.GLTFLoader();
+      var draco = new THREE.DRACOLoader();
+      draco.setDecoderPath('three/draco/');
+      gltfLoader.setDRACOLoader(draco);
+
       resize();
       window.addEventListener('resize', resize);
 
@@ -153,8 +162,7 @@
         return;
       }
 
-      var loader = new THREE.GLTFLoader();
-      loader.load(
+      gltfLoader.load(
         url,
         function (gltf) {
           clearObject();
