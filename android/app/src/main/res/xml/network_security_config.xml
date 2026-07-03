@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- model_viewer_plus sert les fichiers .glb via un proxy HTTP local
+     (http://127.0.0.1:<port>). Depuis Android 9 (API 28) le trafic en
+     clair est bloqué par défaut : sans cette config, la WebView affiche
+     « Page Web non disponible » au lieu du modèle 3D.
+     On n'autorise le clair QUE vers la boucle locale, jamais vers Internet. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

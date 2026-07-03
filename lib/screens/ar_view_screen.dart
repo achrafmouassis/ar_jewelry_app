@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -136,7 +137,12 @@ class _ARViewScreenState extends State<ARViewScreen>
     }
   }
 
-  Future<void> _teardown() async {
+  /// [notify] : ne PAS repasser par setState quand le teardown est déclenché
+  /// depuis `dispose()`. À ce moment l'élément est déjà `defunct` (bien que
+  /// `mounted` renvoie encore true), et un setState y lève l'assertion
+  /// `_lifecycleState != defunct` → crash. Le lifecycle background garde
+  /// notify=true pour ré-afficher le loader.
+  Future<void> _teardown({bool notify = true}) async {
     // Capture refs synchronously before any await to prevent use-after-dispose.
     final CameraController? c = _cam;
     final ARService? ar = _ar;
@@ -144,7 +150,7 @@ class _ARViewScreenState extends State<ARViewScreen>
     _cam = null;
     _ar = null;
     _sub = null;
-    if (mounted) setState(() => _initialized = false);
+    if (notify && mounted) setState(() => _initialized = false);
 
     await sub?.cancel();
     if (c != null) {
@@ -159,7 +165,7 @@ class _ARViewScreenState extends State<ARViewScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _teardown();
+    _teardown(notify: false); // pas de setState pendant l'unmount (defunct)
     _anchor.dispose();
     super.dispose();
   }
@@ -236,46 +242,101 @@ class _ARViewScreenState extends State<ARViewScreen>
     // Aperçu caméra + overlay 3D positionné par ValueListenableBuilder.
     return LayoutBuilder(
       builder: (BuildContext _, BoxConstraints box) {
+        // Cover plein écran : on agrandit l'aperçu pour remplir tout l'écran
+        // (comme un appareil photo natif) sans déformer l'image, quitte à
+        // rogner ce qui déborde. `_cam.value.aspectRatio` est le ratio
+        // paysage du capteur ; à l'endroit (portrait) la largeur/hauteur
+        // sont inversées → arCam = 1 / aspectRatio.
+        final double arCam = 1 / _cam!.value.aspectRatio;
+        final double arScreen = box.maxWidth / box.maxHeight;
+        final double displayW, displayH;
+        if (arCam < arScreen) {
+          // Caméra plus étroite que l'écran → on cale sur la largeur.
+          displayW = box.maxWidth;
+          displayH = box.maxWidth / arCam;
+        } else {
+          // Caméra plus large → on cale sur la hauteur.
+          displayH = box.maxHeight;
+          displayW = box.maxHeight * arCam;
+        }
+        // Décalage du contenu caméra rogné vs. l'écran, pour aligner l'overlay.
+        final double offsetX = (box.maxWidth - displayW) / 2;
+        final double offsetY = (box.maxHeight - displayH) / 2;
+
         return Stack(
           fit: StackFit.expand,
           children: <Widget>[
-            // Centrage + ratio caméra pour éviter les déformations.
-            Center(
-              child: AspectRatio(
-                aspectRatio: _cam!.value.aspectRatio,
+            // Aperçu caméra plein écran (BoxFit.cover manuel via OverflowBox).
+            ClipRect(
+              child: OverflowBox(
+                minWidth: displayW,
+                maxWidth: displayW,
+                minHeight: displayH,
+                maxHeight: displayH,
                 child: CameraPreview(_cam!),
               ),
             ),
+            // Overlay bijou : le ModelViewer est monté UNE SEULE FOIS (passé
+            // via `child`, jamais reconstruit par le builder) puis simplement
+            // repositionné / masqué. Sans ça, chaque perte de détection le
+            // détruisait et relançait une WebView + serveur local → le modèle
+            // n'avait jamais le temps de se charger (et setState-après-dispose).
             ValueListenableBuilder<AnchorResult?>(
               valueListenable: _anchor,
-              builder: (BuildContext _, AnchorResult? r, __) {
-                if (r == null) {
-                  return const SizedBox.shrink();
-                }
-                // Le bijou occupe une fraction de la dimension la plus
-                // petite (scale est normalisé à la frame caméra).
-                final double side =
-                    box.maxWidth.clamp(0, double.infinity) * r.scale;
-                final double left =
-                    r.position.dx * box.maxWidth - side / 2;
-                final double top =
-                    r.position.dy * box.maxHeight - side / 2;
+              child: IgnorePointer(
+                child: _JewelryGlbView(assetPath: widget.jewelry.assetPath),
+              ),
+              builder: (BuildContext _, AnchorResult? r, Widget? child) {
+                final bool visible = r != null;
+                // Le bijou occupe une fraction de la largeur d'affichage
+                // (scale normalisé à la frame caméra).
+                final double scale = r?.scale ?? 0.2;
+                final double side = displayW * scale;
+                final double cx =
+                    offsetX + (r?.position.dx ?? 0.5) * displayW;
+                final double cy =
+                    offsetY + (r?.position.dy ?? 0.5) * displayH;
+                // Détection perdue : on garde la WebView vivante mais hors
+                // écran plutôt que de la retirer de l'arbre. Pas d'Opacity
+                // ici : composer une vue native (WebView) sous une couche
+                // d'opacité produit des artefacts de rendu sur Android.
                 return Positioned(
-                  left: left,
-                  top: top,
+                  left: visible ? cx - side / 2 : -9999,
+                  top: visible ? cy - side / 2 : -9999,
                   width: side,
                   height: side,
-                  child: IgnorePointer(
-                    child: Transform.rotate(
-                      angle: r.rotationRadians,
-                      child: _JewelryGlbView(
-                        assetPath: widget.jewelry.assetPath,
-                      ),
-                    ),
+                  child: Transform.rotate(
+                    angle: r?.rotationRadians ?? 0.0,
+                    child: child,
                   ),
                 );
               },
             ),
+            // Repère de calibration (builds debug uniquement) : point vert
+            // sur le point d'ancrage détecté. Permet de vérifier le tracking
+            // indépendamment du rendu 3D.
+            if (kDebugMode)
+              ValueListenableBuilder<AnchorResult?>(
+                valueListenable: _anchor,
+                builder: (BuildContext _, AnchorResult? r, Widget? __) {
+                  if (r == null) return const SizedBox.shrink();
+                  return Positioned(
+                    left: offsetX + r.position.dx * displayW - 5,
+                    top: offsetY + r.position.dy * displayH - 5,
+                    child: IgnorePointer(
+                      child: Container(
+                        width: 10,
+                        height: 10,
+                        decoration: BoxDecoration(
+                          color: Colors.greenAccent,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.black, width: 1),
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
           ],
         );
       },
@@ -299,9 +360,17 @@ class _JewelryGlbView extends StatelessWidget {
       ar: false,
       autoRotate: false,
       disableZoom: true,
+      disableTap: true,
       cameraControls: false,
+      // Charge le modèle immédiatement, même monté hors écran (le widget
+      // vit à -9999 tant qu'aucune détection n'est arrivée).
+      loading: Loading.eager,
+      reveal: Reveal.auto,
+      interactionPrompt: InteractionPrompt.none,
+      // Vue de face (par défaut model-viewer incline la caméra à 75°,
+      // ce qui donne un bijou vu "de dessus" une fois superposé).
+      cameraOrbit: '0deg 90deg 105%',
       backgroundColor: const Color(0x00000000),
-      // 'reveal: manual' évite l'animation d'apparition à chaque rebuild.
       relatedCss: 'model-viewer { background-color: transparent; }',
     );
   }

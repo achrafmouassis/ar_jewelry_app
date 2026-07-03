@@ -53,6 +53,12 @@ class ARService {
   bool _busy = false; // throttle pour le pipeline visage
   bool _disposed = false;
 
+  /// Ratio hauteur/largeur de la frame **redressée** (portrait). Les landmarks
+  /// MediaPipe sont normalisés indépendamment sur chaque axe : sans ce ratio,
+  /// distances et angles calculés en mélangeant dx et dy sont faux
+  /// (l'axe Y "pèse" ~1,5× plus que l'axe X en portrait).
+  double _frameAspect = 4 / 3;
+
   // Lissage des sorties (anti-jitter).
   final _AnchorSmoother _smoother = _AnchorSmoother();
 
@@ -103,6 +109,9 @@ class ARService {
   void processFrame(CameraImage image, CameraDescription camera) {
     if (_disposed) return;
     if (target == TrackingTarget.hand) {
+      // Buffer capteur en paysage (width > height) ; une fois redressée en
+      // portrait, la hauteur de la frame correspond à image.width.
+      _frameAspect = image.width / image.height;
       _hand?.processFrame(image, camera.sensorOrientation);
     } else {
       if (_busy) return;
@@ -142,25 +151,47 @@ class ARService {
     //  9  = base du majeur (middle finger MCP) — repère d'échelle
     //  13 = base de l'annulaire (ring finger MCP)
     //  14 = phalange intermédiaire de l'annulaire (ring finger PIP)
+    //
+    // Toutes les distances/angles sont calculés en "unités de largeur" :
+    // dy est multiplié par _frameAspect pour compenser la normalisation
+    // indépendante des deux axes.
     final double tx, ty;
+    final double dirX, dirY; // direction anatomique (vers le bout des doigts)
     if (anchor == AnchorPoint.wrist) {
       tx = lm[0].x;
       ty = lm[0].y;
+      dirX = lm[9].x - lm[0].x;
+      dirY = (lm[9].y - lm[0].y) * _frameAspect;
     } else {
       // milieu entre 13 et 14 → emplacement naturel d'une bague
       tx = (lm[13].x + lm[14].x) / 2;
       ty = (lm[13].y + lm[14].y) / 2;
+      dirX = lm[14].x - lm[13].x;
+      dirY = (lm[14].y - lm[13].y) * _frameAspect;
     }
 
-    // Échelle = distance euclidienne entre poignet (0) et MCP majeur (9).
+    // Échelle = distance euclidienne entre poignet (0) et MCP majeur (9),
+    // corrigée du ratio d'aspect (fraction de la LARGEUR de la frame).
     final double dx = lm[9].x - lm[0].x;
-    final double dy = lm[9].y - lm[0].y;
+    final double dy = (lm[9].y - lm[0].y) * _frameAspect;
     final double handSize = math.sqrt(dx * dx + dy * dy);
+
+    // Une bague fait ~ la largeur d'un doigt ; un bracelet couvre le poignet.
+    final double scale = anchor == AnchorPoint.wrist
+        ? (handSize * 0.85).clamp(0.10, 0.60)
+        : (handSize * 0.40).clamp(0.06, 0.35);
+
+    // Rotation : aligne le "haut" du modèle avec la direction du doigt
+    // (bague) ou de l'avant-bras → main (bracelet). En miroir, l'axe X
+    // est inversé donc l'angle aussi.
+    final double mDirX = mirror ? -dirX : dirX;
+    final double rotation = math.atan2(mDirX, -dirY);
 
     final double px = mirror ? 1.0 - tx : tx;
     _emit(AnchorResult(
       position: Offset(px.clamp(0.0, 1.0), ty.clamp(0.0, 1.0)),
-      scale: (handSize * 0.6).clamp(0.05, 0.5),
+      scale: scale,
+      rotationRadians: rotation,
     ));
   }
 
