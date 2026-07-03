@@ -36,6 +36,10 @@ class _ARViewScreenState extends State<ARViewScreen>
   String? _error;
   bool _initialized = false;
 
+  // État du modèle 3D dans la scène three.js (chargement asynchrone du .glb).
+  bool _modelLoaded = false;
+  String? _modelError;
+
   @override
   void initState() {
     super.initState();
@@ -188,6 +192,48 @@ class _ARViewScreenState extends State<ARViewScreen>
                 ],
               ),
             ),
+            // Statut du modèle 3D : spinner tant que le .glb charge dans la
+            // scène three.js, message si le chargement a échoué.
+            if (_initialized && (!_modelLoaded || _modelError != null))
+              Positioned(
+                bottom: 72,
+                left: 16,
+                right: 16,
+                child: Center(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.45),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: _modelError != null
+                        ? const Text(
+                            'Impossible de charger le modèle 3D.',
+                            style: TextStyle(color: Colors.white, fontSize: 12),
+                          )
+                        : const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              SizedBox(width: 10),
+                              Text(
+                                'Chargement du bijou…',
+                                style: TextStyle(
+                                    color: Colors.white, fontSize: 12),
+                              ),
+                            ],
+                          ),
+                  ),
+                ),
+              ),
             // Légende discrète du bijou affiché
             Positioned(
               bottom: 16,
@@ -233,29 +279,37 @@ class _ARViewScreenState extends State<ARViewScreen>
       return const CenteredLoader(label: 'Préparation de la caméra…');
     }
 
-    // Aperçu caméra en fond + overlay three.js plein écran (transparent).
+    // Aperçu caméra + overlay three.js transparent dans la MÊME boîte
+    // (Center + AspectRatio) : les coordonnées de l'AnchorResult sont
+    // normalisées sur la frame caméra, l'overlay doit donc couvrir exactement
+    // l'aperçu — pas tout l'écran — sinon le bijou est décalé dès que le
+    // ratio écran diffère du ratio caméra (letterboxing).
     // L'overlay n'est PAS recréé à chaque frame : la scène three.js interne
     // repositionne le bijou en continu à partir du ValueListenable [_anchor].
-    return Stack(
-      fit: StackFit.expand,
-      children: <Widget>[
-        // Centrage + ratio caméra pour éviter les déformations.
-        Center(
-          child: AspectRatio(
-            aspectRatio: _cam!.value.aspectRatio,
-            child: CameraPreview(_cam!),
-          ),
+    return Center(
+      child: AspectRatio(
+        aspectRatio: _cam!.value.aspectRatio,
+        child: Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            CameraPreview(_cam!),
+            IgnorePointer(
+              child: AROverlayView(
+                anchor: _anchor,
+                assetPath: widget.jewelry.assetPath,
+                // Passer à `true` pour revenir à la sphère PBR de validation.
+                prototypeSphere: false,
+                onLoaded: () {
+                  if (mounted) setState(() => _modelLoaded = true);
+                },
+                onError: (String msg) {
+                  if (mounted) setState(() => _modelError = msg);
+                },
+              ),
+            ),
+          ],
         ),
-        IgnorePointer(
-          child: AROverlayView(
-            anchor: _anchor,
-            assetPath: widget.jewelry.assetPath,
-            // Prototype de validation : sphère PBR dorée ancrée sur le repère.
-            // Passer à `false` pour afficher les vrais .glb.
-            prototypeSphere: true,
-          ),
-        ),
-      ],
+      ),
     );
   }
 }

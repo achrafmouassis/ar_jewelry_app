@@ -92,5 +92,35 @@ void main() {
       expect(res.scale, 0.2);
       expect(res.rotation, 0.1);
     });
+
+    test('déroule la rotation au passage ±π (pas de tour complet)', () {
+      final AnchorSmoother s = AnchorSmoother();
+      // Amorçage juste sous +π.
+      double out = s
+          .apply(position: Offset.zero, scale: 0.2, rotation: 3.1, tMs: 0)
+          .rotation;
+      // L'orientation physique bascule sur la branche −π (−3.1 ≡ +3.18…) :
+      // la sortie lissée doit rester sur la branche continue proche de +π,
+      // pas glisser vers 0 en traversant tout le cercle.
+      for (int i = 1; i <= 30; i++) {
+        out = s
+            .apply(
+                position: Offset.zero, scale: 0.2, rotation: -3.1, tMs: i * 16)
+            .rotation;
+      }
+      expect(out, greaterThan(3.0));
+      expect(out, closeTo(2 * math.pi - 3.1, 0.05));
+    });
+
+    test('reset ré-amorce aussi le déroulage d\'angle', () {
+      final AnchorSmoother s = AnchorSmoother();
+      s.apply(position: Offset.zero, scale: 0.2, rotation: 3.1, tMs: 0);
+      s.reset();
+      // Après reset, aucune référence : la rotation repart telle quelle.
+      final double out = s
+          .apply(position: Offset.zero, scale: 0.2, rotation: -3.1, tMs: 16)
+          .rotation;
+      expect(out, -3.1);
+    });
   });
 }

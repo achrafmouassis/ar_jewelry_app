@@ -62,6 +62,25 @@ void main() {
     });
   });
 
+  group('AnchorMath.handRollRadians', () {
+    test('main pointant vers le haut -> roulis nul', () {
+      // Poignet en bas, base du majeur au-dessus (y vers le bas).
+      final double roll = AnchorMath.handRollRadians(
+          const Offset(100, 400), const Offset(100, 200));
+      expect(roll, closeTo(0.0, 1e-9));
+    });
+    test('main inclinée à droite -> roulis positif (sens horaire écran)', () {
+      final double roll = AnchorMath.handRollRadians(
+          const Offset(100, 400), const Offset(300, 200));
+      expect(roll, closeTo(math.pi / 4, 1e-9)); // 45°
+    });
+    test('main pointant à droite -> quart de tour horaire', () {
+      final double roll = AnchorMath.handRollRadians(
+          const Offset(100, 200), const Offset(300, 200));
+      expect(roll, closeTo(math.pi / 2, 1e-9));
+    });
+  });
+
   group('AnchorMath.rollRadians', () {
     test('yeux horizontaux -> roulis nul', () {
       final double roll =

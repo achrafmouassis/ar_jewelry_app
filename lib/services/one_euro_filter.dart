@@ -68,6 +68,8 @@ class AnchorSmoother {
   final OneEuroFilter _scale = OneEuroFilter(minCutoff: 0.8, beta: 0.01);
   final OneEuroFilter _rot = OneEuroFilter(minCutoff: 1.0, beta: 0.01);
 
+  double? _lastRot; // dernière rotation filtrée (référence de déroulage)
+
   /// Lisse (x, y, scale, rot) à l'instant [tMs]. Renvoie les valeurs filtrées.
   ({Offset position, double scale, double rotation}) apply({
     required Offset position,
@@ -75,11 +77,28 @@ class AnchorSmoother {
     required double rotation,
     required int tMs,
   }) {
+    final double rot = _rot.filter(_unwrap(rotation), tMs);
+    _lastRot = rot;
     return (
       position: Offset(_x.filter(position.dx, tMs), _y.filter(position.dy, tMs)),
       scale: _scale.filter(scale, tMs),
-      rotation: _rot.filter(rotation, tMs),
+      rotation: rot,
     );
+  }
+
+  /// Déroule l'angle sur la branche continue la plus proche de la dernière
+  /// sortie : sans cela, un passage +π → −π (même orientation physique) serait
+  /// lissé linéairement et ferait tournoyer le bijou d'un tour complet.
+  double _unwrap(double rotation) {
+    final double ref = _lastRot ?? rotation;
+    double r = rotation;
+    while (r - ref > math.pi) {
+      r -= 2 * math.pi;
+    }
+    while (r - ref < -math.pi) {
+      r += 2 * math.pi;
+    }
+    return r;
   }
 
   void reset() {
@@ -87,5 +106,6 @@ class AnchorSmoother {
     _y.reset();
     _scale.reset();
     _rot.reset();
+    _lastRot = null;
   }
 }

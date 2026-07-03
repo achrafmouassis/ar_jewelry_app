@@ -41,4 +41,12 @@ class AnchorMath {
   /// Normalise un point pixel (dans une image de dimensions w×h) en [0..1].
   static Offset normalize(Offset pixel, double w, double h) =>
       Offset(pixel.dx / w, pixel.dy / h);
+
+  /// Roulis d'un bijou « main » déduit de l'axe poignet → base du majeur :
+  /// 0 quand la main pointe vers le haut de l'écran, positif quand elle
+  /// s'incline dans le sens horaire (repère écran y vers le bas).
+  /// Coordonnées en pixels (axes de même échelle) pour un angle correct.
+  static double handRollRadians(Offset wrist, Offset middleMcp) =>
+      math.atan2(middleMcp.dy - wrist.dy, middleMcp.dx - wrist.dx) +
+      math.pi / 2;
 }

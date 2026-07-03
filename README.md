@@ -42,9 +42,10 @@ Caméra (camera) ──frames──▶ ARService ──AnchorResult──▶ ARO
 - **Détection 100 % locale** : MediaPipe/ML Kit tournent sur l'appareil ;
   three.js est **bundlé** dans les assets (aucune requête réseau). Aucune image
   du flux caméra ne quitte l'appareil (contrainte RGPD).
-- **Overlay non recréé** : la WebView three.js occupe tout l'écran et
-  repositionne le bijou à chaque frame via un message JS léger — pas de widget
-  reconstruit, pas de rechargement de vue.
+- **Overlay non recréé** : la WebView three.js couvre exactement l'aperçu
+  caméra (même boîte AspectRatio → coordonnées alignées malgré le letterboxing)
+  et repositionne le bijou à chaque frame via un message JS léger — pas de
+  widget reconstruit, pas de rechargement de vue.
 - **Rendu PBR** : `MeshStandardMaterial` (metalness/roughness) + environnement
   `RoomEnvironment` (PMREM) pour des reflets métalliques crédibles.
 - **Assets compressés Draco** : décodeur `DRACOLoader` bundlé (`three/draco/`),

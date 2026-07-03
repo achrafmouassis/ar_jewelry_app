@@ -54,6 +54,11 @@ class ARService {
   bool _busy = false; // throttle pour le pipeline visage
   bool _disposed = false;
 
+  /// Ratio largeur/hauteur de la frame caméra **redressée** (mémorisé à chaque
+  /// frame) : nécessaire pour calculer des angles corrects à partir des
+  /// landmarks normalisés, dont les axes n'ont pas la même échelle.
+  double _uprightAspect = 1.0;
+
   // Lissage des sorties (anti-jitter).
   final AnchorSmoother _smoother = AnchorSmoother();
 
@@ -91,6 +96,10 @@ class ARService {
   void processFrame(CameraImage image, CameraDescription camera) {
     if (_disposed) return;
     if (target == TrackingTarget.hand) {
+      final bool rotated =
+          camera.sensorOrientation == 90 || camera.sensorOrientation == 270;
+      _uprightAspect = (rotated ? image.height : image.width) /
+          (rotated ? image.width : image.height).toDouble();
       _hand?.processFrame(image, camera.sensorOrientation);
     } else {
       if (_busy) return;
@@ -149,9 +158,19 @@ class ARService {
     final double handSize = AnchorMath.distance(middleMcp, wrist);
     final double px = AnchorMath.mirrorX(target.dx, mirror);
 
+    // Roulis de la main (axe poignet → base du majeur), calculé en
+    // pseudo-pixels : x remis à l'échelle de y via le ratio de la frame,
+    // et miroir appliqué AVANT l'angle pour suivre ce que voit l'utilisateur.
+    final double ar = _uprightAspect;
+    final double roll = AnchorMath.handRollRadians(
+      Offset(AnchorMath.mirrorX(wrist.dx, mirror) * ar, wrist.dy),
+      Offset(AnchorMath.mirrorX(middleMcp.dx, mirror) * ar, middleMcp.dy),
+    );
+
     _emit(AnchorResult(
       position: AnchorMath.clampToFrame(Offset(px, target.dy)),
       scale: (handSize * 0.6).clamp(0.05, 0.5),
+      rotationRadians: roll,
     ));
   }
 
