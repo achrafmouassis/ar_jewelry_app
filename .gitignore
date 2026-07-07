@@ -36,3 +36,6 @@ Thumbs.db
 
 # Java heap dumps
 *.hprof
+
+# Modèles 3D originaux non optimisés (trop lourds, hors bundle)
+_original_models_backup/

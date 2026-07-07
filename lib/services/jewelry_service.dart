@@ -21,6 +21,16 @@ class JewelryService {
   // lectures répétées coûteuses.
   Map<String, List<String>>? _filesByFolder;
 
+  // Tous les .glb du manifeste (variantes AR incluses) pour les lookups.
+  Set<String>? _allGlbPaths;
+
+  /// Suffixe des variantes AR : même modèle mais moitié arrière supprimée
+  /// (celle cachée par le doigt/poignet). À travers les ajours on voit alors
+  /// la peau de l'utilisateur → le bijou semble vraiment enroulé autour de
+  /// la main au lieu d'être plaqué dessus. Générées par le script
+  /// tool/glb_cut_back.dart ; exclues de la liste des bijoux.
+  static const String arHalfSuffix = '_arhalf.glb';
+
   /// Métadonnées d'affichage par dossier connu.
   /// Si un nouveau dossier apparaît dans assets/, on l'affiche avec
   /// des valeurs par défaut.
@@ -42,9 +52,14 @@ class JewelryService {
         await AssetManifest.loadFromAssetBundle(rootBundle);
 
     final Map<String, List<String>> grouped = <String, List<String>>{};
+    final Set<String> all = <String>{};
     for (final String path in manifest.listAssets()) {
       if (!path.startsWith('assets/jewelry/')) continue;
       if (!path.toLowerCase().endsWith('.glb')) continue;
+      all.add(path);
+
+      // Les variantes AR ne sont pas des bijoux à lister.
+      if (path.toLowerCase().endsWith(arHalfSuffix)) continue;
 
       // assets/jewelry/<folder>/<file>.glb
       final List<String> parts = path.split('/');
@@ -52,6 +67,7 @@ class JewelryService {
       final String folder = parts[2];
       grouped.putIfAbsent(folder, () => <String>[]).add(path);
     }
+    _allGlbPaths = all;
 
     // Tri stable pour un affichage déterministe.
     for (final List<String> list in grouped.values) {
@@ -89,6 +105,16 @@ class JewelryService {
               type: type,
             ))
         .toList(growable: false);
+  }
+
+  /// Retourne le chemin du modèle à utiliser dans la vue AR : la variante
+  /// "moitié avant" si elle existe, sinon le modèle complet.
+  Future<String> arAssetFor(String assetPath) async {
+    await _ensureLoaded();
+    final String half =
+        assetPath.replaceFirst(RegExp(r'\.glb$', caseSensitive: false),
+            arHalfSuffix);
+    return (_allGlbPaths?.contains(half) ?? false) ? half : assetPath;
   }
 
   // --- helpers privés -----------------------------------------------------

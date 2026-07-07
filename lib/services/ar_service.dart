@@ -19,10 +19,17 @@ class AnchorResult {
   final double scale;    // 0..1 (proportion de la dimension caméra)
   final double rotationRadians;
 
+  /// Inclinaison hors-plan de l'axe anatomique (doigt / avant-bras) :
+  /// positif = pointe vers la caméra, négatif = s'en éloigne. Sert à
+  /// orienter la caméra 3D du rendu pour que le bijou se tourne avec la
+  /// main au lieu de rester plaqué face à l'écran.
+  final double tiltRadians;
+
   const AnchorResult({
     required this.position,
     required this.scale,
     this.rotationRadians = 0.0,
+    this.tiltRadians = 0.0,
   });
 }
 
@@ -53,8 +60,31 @@ class ARService {
   bool _busy = false; // throttle pour le pipeline visage
   bool _disposed = false;
 
+  /// Orientation du capteur (90/270 sur la quasi-totalité des téléphones).
+  /// Nécessaire pour re-projeter les landmarks MediaPipe — qui sont renvoyés
+  /// dans l'espace du buffer capteur BRUT (paysage, ni tourné ni miroir) —
+  /// vers l'espace de l'aperçu affiché (portrait redressé + miroir selfie).
+  int _sensorOrientation = 90;
+
+  /// Throttle du pipeline main : la conversion YUV→RGB du plugin se fait
+  /// pixel par pixel sur le thread appelant. À 30 fps en 720p ça sature le
+  /// thread UI et crée un backlog → l'overlay traîne derrière la main.
+  /// ~15 Hz de détection suffisent, le lissage One-Euro fait le reste.
+  static const int _minHandIntervalMs = 66;
+  int _lastHandFrameMs = 0;
+
+  // Luminosité ambiante moyenne (plan Y, 0..1), échantillonnée ~2×/s.
+  // Sert à caler l'exposition du rendu 3D sur l'éclairage réel de la scène
+  // pour que le bijou ne paraisse pas "éclairé studio" dans une pièce sombre.
+  static const int _lumaIntervalMs = 500;
+  int _lastLumaMs = 0;
+  double _ambientLuma = 0.5;
+
+  /// Dernière luminosité ambiante mesurée (0 = noir, 1 = blanc).
+  double get ambientLuma => _ambientLuma;
+
   /// Ratio hauteur/largeur de la frame **redressée** (portrait). Les landmarks
-  /// MediaPipe sont normalisés indépendamment sur chaque axe : sans ce ratio,
+  /// sont normalisés indépendamment sur chaque axe : sans ce ratio,
   /// distances et angles calculés en mélangeant dx et dy sont faux
   /// (l'axe Y "pèse" ~1,5× plus que l'axe X en portrait).
   double _frameAspect = 4 / 3;
@@ -108,15 +138,48 @@ class ARService {
   /// - Visage : appel ML Kit manuel avec garde anti-backlog.
   void processFrame(CameraImage image, CameraDescription camera) {
     if (_disposed) return;
+    _sampleAmbientLuma(image);
     if (target == TrackingTarget.hand) {
+      final int now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastHandFrameMs < _minHandIntervalMs) return;
+      _lastHandFrameMs = now;
+
+      _sensorOrientation = camera.sensorOrientation;
       // Buffer capteur en paysage (width > height) ; une fois redressée en
-      // portrait, la hauteur de la frame correspond à image.width.
-      _frameAspect = image.width / image.height;
+      // portrait (rotation 90/270), la hauteur de la frame = image.width.
+      final bool rotated =
+          _sensorOrientation == 90 || _sensorOrientation == 270;
+      _frameAspect = rotated
+          ? image.width / image.height
+          : image.height / image.width;
       _hand?.processFrame(image, camera.sensorOrientation);
     } else {
       if (_busy) return;
       _busy = true;
       _processFace(image, camera).whenComplete(() => _busy = false);
+    }
+  }
+
+  /// Moyenne du plan Y (luma) sous-échantillonnée 1/64, en respectant le
+  /// bytesPerRow (le padding de fin de ligne fausserait la moyenne).
+  void _sampleAmbientLuma(CameraImage image) {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastLumaMs < _lumaIntervalMs) return;
+    _lastLumaMs = now;
+
+    final Plane y = image.planes.first;
+    final int rowStride = y.bytesPerRow;
+    int sum = 0, n = 0;
+    for (int r = 0; r < image.height; r += 8) {
+      final int rowStart = r * rowStride;
+      for (int c = 0; c < image.width; c += 8) {
+        sum += y.bytes[rowStart + c];
+        n++;
+      }
+    }
+    if (n > 0) {
+      // EMA légère pour éviter les sautes d'exposition (auto-expo caméra).
+      _ambientLuma = _ambientLuma * 0.6 + (sum / n / 255.0) * 0.4;
     }
   }
 
@@ -132,6 +195,34 @@ class ARService {
   }
 
   // --- MAIN --------------------------------------------------------------
+
+  /// Re-projette un landmark MediaPipe (normalisé dans le buffer capteur
+  /// BRUT, paysage) vers l'espace de l'aperçu affiché : rotation
+  /// [_sensorOrientation] horaire pour redresser, puis miroir horizontal
+  /// si caméra frontale — exactement les transformations que le plugin
+  /// caméra applique au flux vidéo pour l'afficher.
+  Offset _toDisplaySpace(Landmark l) {
+    double x, y;
+    switch (_sensorOrientation) {
+      case 90:
+        x = 1.0 - l.y;
+        y = l.x;
+        break;
+      case 180:
+        x = 1.0 - l.x;
+        y = 1.0 - l.y;
+        break;
+      case 270:
+        x = l.y;
+        y = 1.0 - l.x;
+        break;
+      default: // 0
+        x = l.x;
+        y = l.y;
+    }
+    if (mirror) x = 1.0 - x;
+    return Offset(x, y);
+  }
 
   void _onHands(List<Hand> hands) {
     if (_disposed) return;
@@ -152,46 +243,91 @@ class ARService {
     //  13 = base de l'annulaire (ring finger MCP)
     //  14 = phalange intermédiaire de l'annulaire (ring finger PIP)
     //
-    // Toutes les distances/angles sont calculés en "unités de largeur" :
-    // dy est multiplié par _frameAspect pour compenser la normalisation
-    // indépendante des deux axes.
-    final double tx, ty;
+    // Tous les points sont d'abord re-projetés dans l'espace d'affichage :
+    // le reste du calcul (ancre, direction, échelle, rotation) se fait dans
+    // un seul espace cohérent, sans cas particulier miroir.
+    final Offset wrist = _toDisplaySpace(lm[0]);
+    final Offset indexMcp = _toDisplaySpace(lm[5]);
+    final Offset middleMcp = _toDisplaySpace(lm[9]);
+    final Offset ringMcp = _toDisplaySpace(lm[13]);
+    final Offset ringPip = _toDisplaySpace(lm[14]);
+    final Offset pinkyMcp = _toDisplaySpace(lm[17]);
+
+    // Distances/angles en "unités de largeur" : dy est multiplié par
+    // _frameAspect pour compenser la normalisation indépendante des axes.
+    // dz (profondeur MediaPipe) est déjà à l'échelle de la largeur ; il est
+    // insensible à la rotation écran et au miroir (axe caméra).
+    double tx, ty;
     final double dirX, dirY; // direction anatomique (vers le bout des doigts)
+    final double dirZ;       // <0 = pointe vers la caméra
     if (anchor == AnchorPoint.wrist) {
-      tx = lm[0].x;
-      ty = lm[0].y;
-      dirX = lm[9].x - lm[0].x;
-      dirY = (lm[9].y - lm[0].y) * _frameAspect;
+      // Le landmark 0 est au pli du poignet (base de la paume) ; un bracelet
+      // se porte 2-3 cm plus bas sur l'avant-bras → on décale l'ancre de
+      // 30 % de la longueur de la main à l'opposé des doigts.
+      tx = wrist.dx - (middleMcp.dx - wrist.dx) * 0.30;
+      ty = wrist.dy - (middleMcp.dy - wrist.dy) * 0.30;
+      dirX = middleMcp.dx - wrist.dx;
+      dirY = (middleMcp.dy - wrist.dy) * _frameAspect;
+      dirZ = lm[9].z - lm[0].z;
     } else {
       // milieu entre 13 et 14 → emplacement naturel d'une bague
-      tx = (lm[13].x + lm[14].x) / 2;
-      ty = (lm[13].y + lm[14].y) / 2;
-      dirX = lm[14].x - lm[13].x;
-      dirY = (lm[14].y - lm[13].y) * _frameAspect;
+      tx = (ringMcp.dx + ringPip.dx) / 2;
+      ty = (ringMcp.dy + ringPip.dy) / 2;
+      dirX = ringPip.dx - ringMcp.dx;
+      dirY = (ringPip.dy - ringMcp.dy) * _frameAspect;
+      dirZ = lm[14].z - lm[13].z;
     }
 
-    // Échelle = distance euclidienne entre poignet (0) et MCP majeur (9),
-    // corrigée du ratio d'aspect (fraction de la LARGEUR de la frame).
-    final double dx = lm[9].x - lm[0].x;
-    final double dy = (lm[9].y - lm[0].y) * _frameAspect;
-    final double handSize = math.sqrt(dx * dx + dy * dy);
+    // Largeur du doigt ≈ écart entre les MCP du majeur (9) et de
+    // l'annulaire (13) : bien plus fiable que la taille de main pour
+    // dimensionner une bague, quelle que soit la pose (poing, main ouverte).
+    //
+    // Les mesures incluent la composante z MediaPipe (déjà à l'échelle de
+    // la largeur) : une distance purement 2D rétrécirait dès que la main
+    // s'incline (raccourci de projection) et le bijou avec elle.
+    final double fwx = ringMcp.dx - middleMcp.dx;
+    final double fwy = (ringMcp.dy - middleMcp.dy) * _frameAspect;
+    final double fwz = lm[13].z - lm[9].z;
+    final double fingerW =
+        math.sqrt(fwx * fwx + fwy * fwy + fwz * fwz);
 
-    // Une bague fait ~ la largeur d'un doigt ; un bracelet couvre le poignet.
+    // Largeur de paume = écart MCP index (5) → MCP auriculaire (17).
+    // Le poignet fait ~2/3 de la paume et un jonc l'englobe avec du jeu :
+    // c'est la référence la plus stable pour la taille du bracelet.
+    final double pwx = pinkyMcp.dx - indexMcp.dx;
+    final double pwy = (pinkyMcp.dy - indexMcp.dy) * _frameAspect;
+    final double pwz = lm[17].z - lm[5].z;
+    final double palmW =
+        math.sqrt(pwx * pwx + pwy * pwy + pwz * pwz);
+
+    // model-viewer cadre le modèle sur sa sphère englobante : la fraction
+    // du widget réellement occupée par le diamètre du bijou a été calculée
+    // depuis les GLB (tool/glb_cut_back.dart + sphère three.js) :
+    //   bague ≈ 0,80 · bracelet ≈ 0,70.
+    // Anatomie visée :
+    //   bague : diamètre ≈ 1,15× l'écart MCP majeur-annulaire
+    //           → widget = 1,15 / 0,80 ≈ 1,5 × fingerW ;
+    //   bracelet : poignet visible ≈ 0,9× la paume, jonc = 1,2× le poignet
+    //           → widget = 1,08 / 0,70 ≈ 1,5 × palmW.
     final double scale = anchor == AnchorPoint.wrist
-        ? (handSize * 0.85).clamp(0.10, 0.60)
-        : (handSize * 0.40).clamp(0.06, 0.35);
+        ? (palmW * 1.5).clamp(0.15, 0.80)
+        : (fingerW * 1.5).clamp(0.08, 0.40);
 
     // Rotation : aligne le "haut" du modèle avec la direction du doigt
-    // (bague) ou de l'avant-bras → main (bracelet). En miroir, l'axe X
-    // est inversé donc l'angle aussi.
-    final double mDirX = mirror ? -dirX : dirX;
-    final double rotation = math.atan2(mDirX, -dirY);
+    // (bague) ou de l'avant-bras → main (bracelet). Les points étant déjà
+    // dans l'espace d'affichage, aucun ajustement miroir n'est nécessaire.
+    final double rotation = math.atan2(dirX, -dirY);
 
-    final double px = mirror ? 1.0 - tx : tx;
+    // Inclinaison hors-plan : angle entre l'axe anatomique et le plan écran.
+    // dz < 0 quand la pointe se rapproche de la caméra → tilt positif.
+    final double planar = math.sqrt(dirX * dirX + dirY * dirY);
+    final double tilt = math.atan2(-dirZ, planar);
+
     _emit(AnchorResult(
-      position: Offset(px.clamp(0.0, 1.0), ty.clamp(0.0, 1.0)),
+      position: Offset(tx.clamp(0.0, 1.0), ty.clamp(0.0, 1.0)),
       scale: scale,
       rotationRadians: rotation,
+      tiltRadians: tilt,
     ));
   }
 
@@ -333,6 +469,8 @@ class _AnchorSmoother {
   final _OneEuroFilter _y = _OneEuroFilter(minCutoff: 1.2, beta: 0.02);
   final _OneEuroFilter _scale = _OneEuroFilter(minCutoff: 0.8, beta: 0.01);
   final _OneEuroFilter _rot = _OneEuroFilter(minCutoff: 1.0, beta: 0.01);
+  // La profondeur MediaPipe (z) est plus bruitée que x/y → cutoff plus bas.
+  final _OneEuroFilter _tilt = _OneEuroFilter(minCutoff: 0.6, beta: 0.005);
 
   AnchorResult apply(AnchorResult r) {
     final int t = DateTime.now().millisecondsSinceEpoch;
@@ -340,6 +478,7 @@ class _AnchorSmoother {
       position: Offset(_x.filter(r.position.dx, t), _y.filter(r.position.dy, t)),
       scale: _scale.filter(r.scale, t),
       rotationRadians: _rot.filter(r.rotationRadians, t),
+      tiltRadians: _tilt.filter(r.tiltRadians, t),
     );
   }
 
@@ -348,6 +487,7 @@ class _AnchorSmoother {
     _y.reset();
     _scale.reset();
     _rot.reset();
+    _tilt.reset();
   }
 }
 

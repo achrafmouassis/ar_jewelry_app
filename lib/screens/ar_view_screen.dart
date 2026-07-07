@@ -1,15 +1,18 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:webview_flutter/webview_flutter.dart' show WebViewController;
 
 import '../config/tracking_config.dart';
 import '../main.dart' show cameras;
 import '../models/jewelry_model.dart';
 import '../services/ar_service.dart';
+import '../services/jewelry_service.dart';
 import '../widgets/fps_counter.dart';
 import '../widgets/loading_indicator.dart';
 
@@ -34,6 +37,17 @@ class _ARViewScreenState extends State<ARViewScreen>
   final ValueNotifier<AnchorResult?> _anchor =
       ValueNotifier<AnchorResult?>(null);
 
+  // WebView du ModelViewer : permet de piloter l'orbite caméra 3D en direct
+  // pour incliner le bijou avec la main (rendu "vrai 3D" au lieu d'une
+  // vignette plate). Rempli via onWebViewCreated.
+  WebViewController? _mvController;
+  double _lastTiltDeg = 0;
+  double _lastExposure = 1.2;
+
+  // Chemin du GLB affiché en AR : variante "moitié avant" si disponible
+  // (la moitié arrière serait cachée par le doigt/poignet dans la réalité).
+  late String _arAssetPath = widget.jewelry.assetPath;
+
   String? _error;
   bool _initialized = false;
 
@@ -41,7 +55,40 @@ class _ARViewScreenState extends State<ARViewScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _anchor.addListener(_pushTiltToModelViewer);
     _bootstrap();
+  }
+
+  /// Synchronise le rendu 3D avec la scène réelle :
+  /// - inclinaison : remonte/abaisse la caméra 3D (angle polaire) selon le
+  ///   tilt hors-plan détecté de la main ;
+  /// - exposition : calée sur la luminosité ambiante mesurée sur le flux
+  ///   caméra, pour que le bijou ne brille pas "studio" dans le noir.
+  /// Throttlé (2° / 0,08 d'exposition) pour ne pas spammer la WebView ;
+  /// interpolation-decay côté model-viewer lisse les transitions d'orbite.
+  void _pushTiltToModelViewer() {
+    final AnchorResult? r = _anchor.value;
+    final WebViewController? mv = _mvController;
+    if (r == null || mv == null) return;
+    // Clamp serré : au-delà de ~30° on verrait "à travers" l'anneau, et
+    // l'absence d'occlusion du doigt casserait l'illusion.
+    final double deg =
+        (r.tiltRadians * 180 / math.pi).clamp(-30.0, 30.0);
+    // Luma 0,5 (scène moyenne) → exposition 1,2 (valeur de base) ;
+    // pièce sombre → ~0,7, plein soleil → ~1,7.
+    final double exposure =
+        (0.5 + (_ar?.ambientLuma ?? 0.5) * 1.4).clamp(0.6, 1.7);
+    final bool tiltChanged = (deg - _lastTiltDeg).abs() >= 2.0;
+    final bool expoChanged = (exposure - _lastExposure).abs() >= 0.08;
+    if (!tiltChanged && !expoChanged) return;
+    _lastTiltDeg = deg;
+    _lastExposure = exposure;
+    final double phi = 90.0 - deg;
+    mv.runJavaScript(
+      "var mv=document.getElementById('jewelry-viewer');"
+      "if(mv){mv.setAttribute('camera-orbit','0deg ${phi.toStringAsFixed(1)}deg 105%');"
+      "mv.setAttribute('exposure','${exposure.toStringAsFixed(2)}');}",
+    );
   }
 
   /// Pipeline complet d'initialisation : permission → caméra → AR service.
@@ -50,6 +97,10 @@ class _ARViewScreenState extends State<ARViewScreen>
     // (ex : resume appelé alors que le teardown n'a pas eu lieu).
     if (_cam != null) return;
     try {
+      // 0) Variante AR du modèle (moitié avant seule) si elle est bundlée.
+      _arAssetPath =
+          await JewelryService.instance.arAssetFor(widget.jewelry.assetPath);
+
       // 1) Permission caméra
       final PermissionStatus status = await Permission.camera.request();
       if (!status.isGranted) {
@@ -166,7 +217,9 @@ class _ARViewScreenState extends State<ARViewScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _teardown(notify: false); // pas de setState pendant l'unmount (defunct)
+    _anchor.removeListener(_pushTiltToModelViewer);
     _anchor.dispose();
+    _mvController = null;
     super.dispose();
   }
 
@@ -284,14 +337,24 @@ class _ARViewScreenState extends State<ARViewScreen>
             ValueListenableBuilder<AnchorResult?>(
               valueListenable: _anchor,
               child: IgnorePointer(
-                child: _JewelryGlbView(assetPath: widget.jewelry.assetPath),
+                child: _JewelryGlbView(
+                  assetPath: _arAssetPath,
+                  orientation: TrackingConfig.orientationFor(
+                      widget.jewelry.type.folder),
+                  onWebViewCreated: (WebViewController c) =>
+                      _mvController = c,
+                ),
               ),
               builder: (BuildContext _, AnchorResult? r, Widget? child) {
                 final bool visible = r != null;
+                // La WebView garde une taille FIXE (retailler une platform
+                // view à chaque frame déclenche un relayout natif →enfer de
+                // perfs). La taille apparente du bijou est appliquée par
+                // Transform.scale, une simple transformation GPU de texture.
+                final double baseSide = displayW * 0.6;
                 // Le bijou occupe une fraction de la largeur d'affichage
                 // (scale normalisé à la frame caméra).
-                final double scale = r?.scale ?? 0.2;
-                final double side = displayW * scale;
+                final double side = displayW * (r?.scale ?? 0.2);
                 final double cx =
                     offsetX + (r?.position.dx ?? 0.5) * displayW;
                 final double cy =
@@ -301,13 +364,16 @@ class _ARViewScreenState extends State<ARViewScreen>
                 // ici : composer une vue native (WebView) sous une couche
                 // d'opacité produit des artefacts de rendu sur Android.
                 return Positioned(
-                  left: visible ? cx - side / 2 : -9999,
-                  top: visible ? cy - side / 2 : -9999,
-                  width: side,
-                  height: side,
+                  left: visible ? cx - baseSide / 2 : -9999,
+                  top: visible ? cy - baseSide / 2 : -9999,
+                  width: baseSide,
+                  height: baseSide,
                   child: Transform.rotate(
                     angle: r?.rotationRadians ?? 0.0,
-                    child: child,
+                    child: Transform.scale(
+                      scale: side / baseSide,
+                      child: child,
+                    ),
                   ),
                 );
               },
@@ -349,12 +415,19 @@ class _ARViewScreenState extends State<ARViewScreen>
 /// à chaque update du Positioned parent.
 class _JewelryGlbView extends StatelessWidget {
   final String assetPath;
-  const _JewelryGlbView({required this.assetPath});
+  final String? orientation;
+  final ValueChanged<WebViewController>? onWebViewCreated;
+  const _JewelryGlbView({
+    required this.assetPath,
+    this.orientation,
+    this.onWebViewCreated,
+  });
 
   @override
   Widget build(BuildContext context) {
     return ModelViewer(
       key: ValueKey<String>(assetPath),
+      id: 'jewelry-viewer',
       src: assetPath, // chemin asset Flutter, model_viewer_plus l'expose en local
       alt: 'Bijou 3D',
       ar: false,
@@ -370,8 +443,30 @@ class _JewelryGlbView extends StatelessWidget {
       // Vue de face (par défaut model-viewer incline la caméra à 75°,
       // ce qui donne un bijou vu "de dessus" une fois superposé).
       cameraOrbit: '0deg 90deg 105%',
+      // Cible fixe à l'origine du modèle : le camera-target auto vise le
+      // centre de la bbox, qui est décalé sur les variantes AR coupées
+      // (moitié arrière supprimée) → le bijou glisserait hors de l'ancre.
+      cameraTarget: '0m 0m 0m',
+      // Ré-oriente le modèle en pose "porté" (voir TrackingConfig).
+      orientation: orientation,
+      // FOV serré (télé) : à cette taille apparente, un bijou réel est vu
+      // à distance de bras — un grand-angle le déformerait (effet macro).
+      fieldOfView: '22deg',
+      // Lisse les changements d'orbite pilotés par le tilt de la main.
+      interpolationDecay: 90,
+      // Éclairage studio uniforme : indispensable pour que les matériaux
+      // PBR métalliques aient des reflets au lieu d'un rendu gris plat.
+      environmentImage: 'neutral',
+      exposure: 1.2,
+      // `tone-mapping` n'est pas exposé par l'API Dart du package : on
+      // l'injecte en JS. "neutral" = Khronos PBR Neutral, conçu pour
+      // l'e-commerce — il préserve la teinte réelle de l'or/argent là où
+      // le tone mapping par défaut (ACES) désature et assombrit les métaux.
+      relatedJs: "var mv=document.getElementById('jewelry-viewer');"
+          "if(mv){mv.setAttribute('tone-mapping','neutral');}",
       backgroundColor: const Color(0x00000000),
       relatedCss: 'model-viewer { background-color: transparent; }',
+      onWebViewCreated: onWebViewCreated,
     );
   }
 }

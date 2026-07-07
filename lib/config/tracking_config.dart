@@ -37,11 +37,26 @@ class TrackingConfig {
     'perles': AnchorPoint.forehead,
   };
 
+  /// Correction d'orientation model-viewer ("roll pitch yaw") par type.
+  ///
+  /// Les modèles Meshy sont exportés en pose "photo produit" : la bague a
+  /// son trou face caméra (axe Z) et sa pierre vers le haut. Portée au
+  /// doigt, le trou doit suivre le doigt (vertical dans le widget) et la
+  /// pierre faire face à la caméra → tangage +90°. Vérifié visuellement
+  /// sur les GLB actuels ; à ajuster si un nouveau modèle est exporté
+  /// avec d'autres axes. Le bracelet Meshy a déjà son axe vertical.
+  static const Map<String, String> _orientationByFolder = <String, String>{
+    'bagues': '0deg 90deg 0deg',
+  };
+
   static TrackingTarget targetFor(String folder) =>
       _targetByFolder[folder] ?? TrackingTarget.hand;
 
   static AnchorPoint anchorFor(String folder) =>
       _anchorByFolder[folder] ?? AnchorPoint.ringFinger;
+
+  static String? orientationFor(String folder) =>
+      _orientationByFolder[folder];
 
   /// Renvoie la direction caméra adaptée au type de bijou.
   /// Toujours caméra frontale (mode miroir selfie) pour une expérience try-on.

@@ -24,6 +24,9 @@ dependencies:
   # Rendu 3D des fichiers .glb superposés à la caméra
   model_viewer_plus: ^1.7.1
 
+  # Accès direct au WebViewController du ModelViewer (orientation 3D dynamique)
+  webview_flutter: ^4.13.0
+
   # Permissions runtime
   permission_handler: ^11.3.1
 
