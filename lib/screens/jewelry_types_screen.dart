@@ -128,6 +128,12 @@ class _JewelryTypesScreenState extends State<JewelryTypesScreen> {
               subtitle: const Text('Suivi de l\'annulaire'),
               onTap: () => Navigator.of(ctx).pop('bagues'),
             ),
+            ListTile(
+              leading: const Icon(Icons.diamond_outlined),
+              title: const Text('Collier'),
+              subtitle: const Text('Suivi du cou (épaules + tête)'),
+              onTap: () => Navigator.of(ctx).pop('colliers'),
+            ),
           ],
         ),
       ),
@@ -147,7 +153,11 @@ class _JewelryTypesScreenState extends State<JewelryTypesScreen> {
     // sa moitié arrière avec un cylindre occluseur de profondeur qui suit le
     // bras/doigt — les variantes _arhalf ne servent plus ici.
     final String assetPath = items.first.assetPath;
-    final String anchor = folder == 'bracelets' ? 'wrist' : 'ringFinger';
+    final String anchor = switch (folder) {
+      'bracelets' => 'wrist',
+      'colliers' => 'neck',
+      _ => 'ringFinger',
+    };
     Navigator.of(context).push(MaterialPageRoute<void>(
       builder: (_) => NativeArTestScreen(
         assetPath: assetPath,

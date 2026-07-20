@@ -45,6 +45,10 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
 
   bool get _isWrist => widget.anchor == 'wrist';
 
+  /// Le collier n'a pas de calibration à l'écran : on ne peut pas poser son
+  /// cou sur la dalle. Son échelle vient de la largeur d'épaules mesurée.
+  bool get _isNeck => widget.anchor == 'neck';
+
   @override
   void initState() {
     super.initState();
@@ -57,8 +61,11 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
     });
   }
 
-  double _correctionOf(Calibration c) =>
-      _isWrist ? c.braceletCorrection : c.ringCorrection;
+  double _correctionOf(Calibration c) => switch (widget.anchor) {
+        'neck' => 1.0,
+        'wrist' => c.braceletCorrection,
+        _ => c.ringCorrection,
+      };
 
   Future<void> _openCalibration() async {
     await Navigator.of(context).push(
@@ -83,11 +90,12 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
         backgroundColor: Colors.black87,
         foregroundColor: Colors.white,
         actions: <Widget>[
-          IconButton(
-            icon: const Icon(Icons.straighten),
-            tooltip: _isWrist ? 'Mesurer mon poignet' : 'Mesurer mon doigt',
-            onPressed: _openCalibration,
-          ),
+          if (!_isNeck)
+            IconButton(
+              icon: const Icon(Icons.straighten),
+              tooltip: _isWrist ? 'Mesurer mon poignet' : 'Mesurer mon doigt',
+              onPressed: _openCalibration,
+            ),
           IconButton(
             icon: Icon(
               _debugOccluder ? Icons.visibility : Icons.visibility_off,

@@ -475,7 +475,15 @@ class NativeArView(
         } else {
             0.5f * kWristWidthPerHand * worldHandLen * scaleCorrection
         }
-        val sRaw = if (anchor == "wrist") {
+        // Collier : le canal "taille de main" porte la largeur d'épaules. Le
+        // rayon du cou en est déduit anatomiquement, et l'échelle est posée
+        // pour que l'OUVERTURE du plastron (rayon intérieur mesuré sur le
+        // GLB : 0.507 unité) épouse le cou.
+        val worldShoulderW = hypot(handDX * 2f * halfW, handDY * 2f * halfH)
+        val sRaw = if (anchor == "neck") {
+            0.5f * kNeckWidthPerShoulder * worldShoulderW * scaleCorrection *
+                kNecklaceClearance / kNecklaceInnerRadius
+        } else if (anchor == "wrist") {
             // Le rayon voulu est celui au CENTRE de la bande, situé à
             // s·(kBandHalfHeight + kBandGap) vers le coude — mais ce centre
             // dépend de s, qui dépend du rayon. Plutôt que d'itérer :
@@ -503,8 +511,17 @@ class NativeArView(
         // poignet : centre = poignet + (demi-hauteur + marge) vers le coude
         // (-axis). La composante planaire brute de l'axe raccourcit
         // naturellement l'offset écran quand le bras plonge vers la caméra.
-        val alongOff =
-            if (anchor == "wrist") s * (kBandHalfHeight + kBandGap) else 0f
+        // Collier : même piège que la manchette, en plus marqué — l'ouverture
+        // du plastron est à Y=+0.90 dans le modèle, PAS à son centre. Centrer
+        // la pièce sur le cou la placerait ~1 unité trop haut, l'anneau
+        // au-dessus du menton. On descend donc l'origine du modèle de
+        // 0.90×s sous le creux sternal : l'ouverture y affleure et la pièce
+        // retombe sur la poitrine.
+        val alongOff = when (anchor) {
+            "wrist" -> s * (kBandHalfHeight + kBandGap)
+            "neck" -> s * kNecklaceOpeningY
+            else -> 0f
+        }
         val wx = (aX - 0.5f) * 2f * halfW - axis[0] * alongOff
         val wy = (0.5f - aY) * 2f * halfH - axis[1] * alongOff
         // Gram-Schmidt : composante de la normale orthogonale à l'axe.
@@ -568,7 +585,14 @@ class NativeArView(
         val colY: FloatArray
         val colZ: FloatArray
         val roll = if (anchor == "wrist") smoothRoll else null
-        if (roll != null) {
+        if (anchor == "neck") {
+            // norm porte déjà la ligne d'épaules orthogonalisée contre l'axe
+            // du cou (cf. onPoseNeck) : c'est colX. Aucune normale dérivée
+            // n'intervient, donc pas de roulis qui dérive.
+            colY = axis
+            colX = norm
+            colZ = cross(colX, colY)
+        } else if (roll != null) {
             // Base pilotée par la silhouette : colX = largeur mesurée du
             // poignet, ré-orthogonalisée (l'axe du bras a pu bouger depuis la
             // dernière mesure de masque, qui tourne ~2× moins vite).
@@ -627,7 +651,7 @@ class NativeArView(
             // deux autres colonnes portent les rayons radiaux.
             val axisDir: FloatArray
             val radial: FloatArray
-            if (anchor == "wrist") {
+            if (anchor == "wrist" || anchor == "neck") {
                 axisDir = colY
                 radial = colZ
             } else {
@@ -643,7 +667,15 @@ class NativeArView(
             val r1: Float
             val r2: Float
             val len: Float
-            if (anchor == "wrist") {
+            if (anchor == "neck") {
+                // Le cou masque l'arrière du collier. Rayon retrouvé depuis
+                // l'échelle (donc rigidement solidaire de la pièce), section
+                // légèrement aplatie d'avant en arrière comme un vrai cou.
+                r1 = s * kNecklaceInnerRadius / kNecklaceClearance *
+                    kOccluderMargin
+                r2 = r1 * kNeckDepthRatio
+                len = s * kNeckOccLen
+            } else if (anchor == "wrist") {
                 val wristR = s * kModelInnerRadius / kBraceletClearance
                 r1 = wristR * kOccluderMargin
                 r2 = r1 * kWristDepthRatio
@@ -653,11 +685,18 @@ class NativeArView(
                 r2 = s * kRingOccRadius
                 len = s * kRingOccLen
             }
+            // L'occluseur suit le MEMBRE, pas l'origine du modèle. Pour la
+            // manchette et la bague les deux coïncident ; pour le collier
+            // l'origine a été descendue de alongOff sous le creux sternal,
+            // alors que le cou à masquer est au-dessus → on remonte.
+            val occRise = if (anchor == "neck") alongOff + s * kNeckOccRise else 0f
+            val ox = wx + axis[0] * occRise
+            val oy = wy + axis[1] * occRise
             val om = floatArrayOf(
                 colX[0] * r1, colX[1] * r1, colX[2] * r1, 0f,
                 axisDir[0] * len, axisDir[1] * len, axisDir[2] * len, 0f,
                 radial[0] * r2, radial[1] * r2, radial[2] * r2, 0f,
-                wx, wy, 0f, 1f,
+                ox, oy, 0f, 1f,
             )
             tcm.setTransform(tcm.getInstance(occ.root), om)
         }
@@ -666,6 +705,9 @@ class NativeArView(
     // --- MediaPipe ---------------------------------------------------------
 
     private fun setupHandLandmarker() {
+        // Le collier ne dépend que de la pose (épaules + tête) : pas de main
+        // dans le cadrage, et un 2e détecteur coûterait du CPU pour rien.
+        if (anchor == "neck") return
         try {
             val baseOptions = BaseOptions.builder()
                 .setModelAssetPath(MODEL_ASSET)
@@ -701,8 +743,10 @@ class NativeArView(
     }
 
     private fun setupPoseLandmarker() {
-        // L'avant-bras n'intéresse que le bracelet ; la bague suit le doigt.
-        if (anchor != "wrist") return
+        // Manchette : axe de l'avant-bras. Collier : épaules + tête, c'est le
+        // détecteur PRINCIPAL (aucune main dans le cadrage). La bague suit le
+        // doigt et n'a pas besoin de la pose.
+        if (anchor != "wrist" && anchor != "neck") return
         try {
             val baseOptions = BaseOptions.builder()
                 .setModelAssetPath(POSE_MODEL_ASSET)
@@ -736,6 +780,10 @@ class NativeArView(
      *  (invariante à la rotation d'image) vient des world landmarks, remise
      *  à l'échelle écran via le rapport des longueurs planaires. */
     private fun onPose(result: PoseLandmarkerResult) {
+        if (anchor == "neck") {
+            onPoseNeck(result)
+            return
+        }
         val lms = result.landmarks()
         if (lms.isEmpty()) return
         val lm = lms[0]
@@ -951,6 +999,175 @@ class NativeArView(
                     "candDroit=(${candUpright[0]}, ${candUpright[1]}) " +
                     "score=${score(candUpright)} choisi=${if (useRot) "rot" else "droit"} " +
                     "axe=(${chosen[0]}, ${chosen[1]}, ${chosen[2]})",
+            )
+        }
+    }
+
+    /** Suivi du COLLIER : la pose est ici le détecteur principal (il n'y a
+     *  pas de main dans le cadrage), donc cette fonction écrit directement
+     *  tout l'état lu par la boucle de rendu — ancre, axe, roulis, taille.
+     *
+     *  Repères choisis, et pourquoi :
+     *   - ancre = milieu des épaules (11/12) ≈ creux sternal, là où repose
+     *     l'ouverture d'un plastron ;
+     *   - axe du trou (+Y modèle) = milieu des épaules → milieu des oreilles
+     *     (7/8) : l'axe réel du cou, insensible à l'inclinaison de la tête
+     *     autour de son propre axe ;
+     *   - roulis : la LIGNE D'ÉPAULES donne colX directement. C'est le même
+     *     levier que la silhouette pour la manchette — une mesure franche
+     *     plutôt qu'une normale dérivée, donc pas de dérive de roulis. */
+    private fun onPoseNeck(result: PoseLandmarkerResult) {
+        val lms = result.landmarks()
+        if (lms.isEmpty()) {
+            hasHand = false
+            return
+        }
+        val lm = lms[0]
+        if (lm.size < 13) {
+            hasHand = false
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (now - lastHandMs > kResetAfterMs) resetFilters()
+        lastHandMs = now
+
+        val rot = frameRotation
+        val uprightW = if (rot == 90 || rot == 270) frameH else frameW
+        val uprightH = if (rot == 90 || rot == 270) frameW else frameH
+        var cx = 1f
+        var cy = 1f
+        if (uprightW > 0 && uprightH > 0 && root.width > 0 && root.height > 0) {
+            val imgAspect = uprightW.toFloat() / uprightH
+            val viewAspect = root.width.toFloat() / root.height
+            if (imgAspect > viewAspect) cx = imgAspect / viewAspect
+            else cy = viewAspect / imgAspect
+        }
+
+        fun toScr(x: Float, y: Float, applyRot: Boolean): FloatArray {
+            val ux: Float
+            val uy: Float
+            if (applyRot) {
+                when (rot) {
+                    90 -> { ux = 1f - y; uy = x }
+                    180 -> { ux = 1f - x; uy = 1f - y }
+                    270 -> { ux = y; uy = 1f - x }
+                    else -> { ux = x; uy = y }
+                }
+            } else {
+                ux = x
+                uy = y
+            }
+            return floatArrayOf(
+                1f - (0.5f + (ux - 0.5f) * cx),
+                0.5f + (uy - 0.5f) * cy,
+            )
+        }
+
+        // Même piège que pour l'avant-bras : selon device/version, les
+        // landmarks de pose arrivent redressés ou en espace capteur brut. On
+        // calcule les deux conventions et on garde celle dont l'axe du cou
+        // pointe le plus "vers le haut" de l'écran — un cou filmé de face
+        // monte toujours, ce qui rend le test fiable sans référence externe.
+        fun neckUp(applyRot: Boolean): FloatArray {
+            val sl = toScr(lm[11].x(), lm[11].y(), applyRot)
+            val sr = toScr(lm[12].x(), lm[12].y(), applyRot)
+            val el = toScr(lm[7].x(), lm[7].y(), applyRot)
+            val er = toScr(lm[8].x(), lm[8].y(), applyRot)
+            val sx = (sl[0] + sr[0]) * 0.5f
+            val sy = (sl[1] + sr[1]) * 0.5f
+            val hx = (el[0] + er[0]) * 0.5f
+            val hy = (el[1] + er[1]) * 0.5f
+            return floatArrayOf(hx - sx, -(hy - sy), 0f)
+        }
+
+        val upRot = neckUp(true)
+        val upStraight = neckUp(false)
+        val useRot = normalized(upRot, floatArrayOf(0f, 0f, 0f))[1] >=
+            normalized(upStraight, floatArrayOf(0f, 0f, 0f))[1]
+
+        val shL = toScr(lm[11].x(), lm[11].y(), useRot)
+        val shR = toScr(lm[12].x(), lm[12].y(), useRot)
+        val shMidX = (shL[0] + shR[0]) * 0.5f
+        val shMidY = (shL[1] + shR[1]) * 0.5f
+
+        var up = normalized(
+            if (useRot) upRot else upStraight,
+            fallback = floatArrayOf(0f, 1f, 0f),
+        )
+        // Profondeur de l'axe du cou depuis les world landmarks (z invariant
+        // à la rotation d'image), remise à l'échelle écran par le rapport des
+        // longueurs planaires — même recette que l'avant-bras.
+        val wls = result.worldLandmarks()
+        if (wls.isNotEmpty() && wls[0].size > 12) {
+            val w = wls[0]
+            val wdz = (w[7].z() + w[8].z()) * 0.5f -
+                (w[11].z() + w[12].z()) * 0.5f
+            val wPlanar = hypot(
+                (w[7].x() + w[8].x()) * 0.5f - (w[11].x() + w[12].x()) * 0.5f,
+                (w[7].y() + w[8].y()) * 0.5f - (w[11].y() + w[12].y()) * 0.5f,
+            )
+            val sPlanar = hypot(up[0], up[1])
+            if (wPlanar > 1e-4f && sPlanar > 1e-4f) {
+                up = normalized(
+                    floatArrayOf(up[0], up[1], -wdz * (sPlanar / wPlanar)),
+                    fallback = up,
+                )
+            }
+        }
+
+        // Ligne d'épaules → colX. Orthogonalisée contre l'axe du cou, puis
+        // orientée pour que colZ = colX × colY sorte vers la caméra (le motif
+        // décoré du plastron est en +Z, cf. mesure du GLB : 356 k sommets
+        // avant contre 78 k arrière).
+        val shVec = floatArrayOf(shR[0] - shL[0], -(shR[1] - shL[1]), 0f)
+        val dsh = shVec[0] * up[0] + shVec[1] * up[1] + shVec[2] * up[2]
+        var side = normalized(
+            floatArrayOf(
+                shVec[0] - dsh * up[0],
+                shVec[1] - dsh * up[1],
+                shVec[2] - dsh * up[2],
+            ),
+            fallback = anyPerpendicular(up),
+        )
+        if (cross(side, up)[2] < 0f) {
+            side = floatArrayOf(-side[0], -side[1], -side[2])
+        }
+
+        // Ancre : creux sternal, légèrement au-dessus du milieu des épaules.
+        val shoulderW = hypot(shR[0] - shL[0], shR[1] - shL[1])
+        val ax = (shMidX - up[0] * kNeckRise * shoulderW).coerceIn(0f, 1f)
+        val ay = (shMidY + up[1] * kNeckRise * shoulderW).coerceIn(0f, 1f)
+
+        val px = fX.filter(ax, now)
+        val py = fY.filter(ay, now)
+        smX = (px + (fX.velocity * kLeadSeconds).coerceIn(-kMaxLead, kMaxLead))
+            .coerceIn(0f, 1f)
+        smY = (py + (fY.velocity * kLeadSeconds).coerceIn(-kMaxLead, kMaxLead))
+            .coerceIn(0f, 1f)
+
+        axisVec = floatArrayOf(
+            fAxis[0].filter(up[0], now),
+            fAxis[1].filter(up[1], now),
+            fAxis[2].filter(up[2], now),
+        )
+        normVec = floatArrayOf(
+            fNorm[0].filter(side[0], now),
+            fNorm[1].filter(side[1], now),
+            fNorm[2].filter(side[2], now),
+        )
+        // Réutilise le canal "taille de main" pour la largeur d'épaules :
+        // c'est la grandeur d'échelle de repli du collier.
+        handDX = fHandDX.filter(shR[0] - shL[0], now)
+        handDY = fHandDY.filter(shR[1] - shL[1], now)
+        hasHand = true
+
+        if (poseLogCount++ % 15 == 0) {
+            Log.i(
+                TAG,
+                "cou: conv=${if (useRot) "rot" else "droit"} " +
+                    "ancre=($smX, $smY) épaules=$shoulderW " +
+                    "haut=(${axisVec[0]}, ${axisVec[1]}, ${axisVec[2]}) " +
+                    "côté=(${normVec[0]}, ${normVec[1]}, ${normVec[2]})",
             )
         }
     }
@@ -1230,8 +1447,10 @@ class NativeArView(
     }
 
     private fun analyze(image: ImageProxy) {
+        // Collier : handLandmarker est volontairement null, c'est la pose qui
+        // pilote — ne pas sortir ici, sinon plus aucune détection.
         val lm = handLandmarker
-        if (lm == null) {
+        if (lm == null && poseLandmarker == null) {
             image.close()
             return
         }
@@ -1247,10 +1466,11 @@ class NativeArView(
                 .setRotationDegrees(image.imageInfo.rotationDegrees)
                 .build()
             val ts = SystemClock.uptimeMillis()
-            lm.detectAsync(mpImage, opts, ts)
-            // Pose une frame sur deux : l'avant-bras bouge moins vite que la
-            // main, et ça limite le coût CPU du second détecteur.
-            if (analysisFrameCount++ % 2 == 0) {
+            lm?.detectAsync(mpImage, opts, ts)
+            // Collier : la pose est le détecteur principal → chaque frame.
+            // Manchette : une frame sur deux suffit (l'avant-bras bouge moins
+            // vite que la main) et ça limite le coût du 2e détecteur.
+            if (anchor == "neck" || analysisFrameCount++ % 2 == 0) {
                 poseLandmarker?.detectAsync(mpImage, opts, ts)
             }
         } catch (e: Exception) {
@@ -1446,6 +1666,41 @@ class NativeArView(
         /** Marge (fraction de s) entre le pli du poignet et le bord
          *  supérieur de la manchette. */
         private const val kBandGap = 0.05f
+
+        // --- Collier (plastron) ---
+        // Constantes MESURÉES sur assets/jewelry/colliers/collier.glb
+        // (script glb_necklace/glb_neck2, scratchpad) : 434 k sommets, axe du
+        // trou = Y, motif décoré en +Z (356 k sommets avant / 78 k arrière).
+
+        /** Rayon intérieur de l'OUVERTURE du plastron, en unités modèle —
+         *  pris au plus étroit (Y ≈ +0.85..+1.0), là où le cou passe. */
+        private const val kNecklaceInnerRadius = 0.507f
+
+        /** Hauteur de cette ouverture dans le modèle. Le collier ne se porte
+         *  PAS par son centre : l'origine du GLB descend de cette valeur ×
+         *  échelle sous le creux sternal pour que l'ouverture y affleure. */
+        private const val kNecklaceOpeningY = 0.90f
+
+        /** Jeu de l'ouverture autour du cou : un plastron repose dessus,
+         *  il est donc ajusté (contrairement à un jonc qui pendouille). */
+        private const val kNecklaceClearance = 1.08f
+
+        /** Largeur du cou en fraction de la largeur d'épaules (biacromiale) :
+         *  cou ~12 cm pour des épaules ~40 cm. Sert d'échelle de repli. */
+        private const val kNeckWidthPerShoulder = 0.30f
+
+        /** Montée de l'ancre au-dessus du milieu des épaules, en fraction de
+         *  la largeur d'épaules : vise le creux sternal plutôt que la ligne
+         *  acromiale, qui est un peu basse. */
+        private const val kNeckRise = 0.08f
+
+        /** Profondeur du cou / largeur (section légèrement aplatie). */
+        private const val kNeckDepthRatio = 0.85f
+
+        /** Occluseur du cou : longueur (× échelle) et remontée de son centre
+         *  au-dessus de l'ancre, pour couvrir le cou et non la poitrine. */
+        private const val kNeckOccLen = 2.4f
+        private const val kNeckOccRise = 0.35f
 
         /** Vitesse du fondu du guide de placement (fraction par frame). */
         private const val kGuideFade = 0.08f
