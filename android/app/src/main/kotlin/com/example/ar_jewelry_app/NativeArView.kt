@@ -192,6 +192,17 @@ class NativeArView(
     private val debugOccluder: Boolean =
         (args as? Map<*, *>)?.get("debugOccluder") as? Boolean ?: false
 
+    // Correction morphologique issue de la calibration à l'écran (doigt/
+    // poignet mesuré sur la dalle, cf. CalibrationService côté Dart). Les
+    // world landmarks MediaPipe sont l'ajustement d'un modèle de main
+    // GÉNÉRIQUE : métriques, mais biaisés pour une main donnée. Ce facteur
+    // ramène l'échelle à la morphologie réelle. 1.0 = non calibré = rendu
+    // inchangé ; borné pour qu'une calibration aberrante ne puisse pas
+    // produire un bijou absurde.
+    private val scaleCorrection: Float =
+        ((args as? Map<*, *>)?.get("scaleCorrection") as? Number)
+            ?.toFloat()?.coerceIn(0.7f, 1.4f) ?: 1.0f
+
     // --- Filtres One-Euro (mêmes constantes que la version Dart) -----------
     private val fX = OneEuroFilter(minCutoff = 1.2f, beta = 0.02f)
     private val fY = OneEuroFilter(minCutoff = 1.2f, beta = 0.02f)
@@ -421,15 +432,20 @@ class NativeArView(
         // NB : la largeur silhouette d'un cylindre perpendiculaire à son axe
         // projeté = son diamètre, quel que soit le basculement → pas de
         // correction de perspective à appliquer sur cette mesure.
+        // La correction morphologique ne s'applique qu'aux estimations
+        // GÉNÉRIQUES : la largeur lue sur le masque est déjà celle du bras
+        // réel de l'utilisateur, la corriger la fausserait. Seul le repli
+        // anatomique (ratio de population) et l'échelle de la bague (dérivée
+        // de la taille de main du modèle générique) en ont besoin.
         val worldWristRadius = if (segFresh) {
             0.5f * hypot(seg!![2] * 2f * halfW, seg[3] * 2f * halfH)
         } else {
-            0.5f * kWristWidthPerHand * worldHandLen
+            0.5f * kWristWidthPerHand * worldHandLen * scaleCorrection
         }
         val sRaw = if (anchor == "wrist") {
             worldWristRadius * kBraceletClearance / kModelInnerRadius
         } else {
-            worldHandLen * kRingPerHand
+            worldHandLen * kRingPerHand * scaleCorrection
         }
         smoothScale = if (smoothScale <= 0f) sRaw
         else smoothScale + kScaleLerp * (sRaw - smoothScale)

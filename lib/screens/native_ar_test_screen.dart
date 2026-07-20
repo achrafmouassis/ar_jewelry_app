@@ -5,6 +5,9 @@ import 'package:flutter/rendering.dart' show PlatformViewHitTestBehavior;
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../services/calibration_service.dart';
+import 'calibration_screen.dart';
+
 /// Écran de test de la vue AR NATIVE.
 ///
 /// Étape B.2a : la PlatformView `native-ar-view` affiche le bijou rendu par
@@ -37,6 +40,11 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
   // vérifier sa présence, sa position et sa taille. Recrée la vue native.
   bool _debugOccluder = false;
 
+  /// Facteur morphologique passé au rendu natif (1.0 = non calibré).
+  double _correction = 1.0;
+
+  bool get _isWrist => widget.anchor == 'wrist';
+
   @override
   void initState() {
     super.initState();
@@ -44,6 +52,26 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
     Permission.camera.request().then((PermissionStatus s) {
       if (mounted) setState(() => _granted = s.isGranted);
     });
+    CalibrationService.load().then((Calibration c) {
+      if (mounted) setState(() => _correction = _correctionOf(c));
+    });
+  }
+
+  double _correctionOf(Calibration c) =>
+      _isWrist ? c.braceletCorrection : c.ringCorrection;
+
+  Future<void> _openCalibration() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<double>(
+        builder: (_) => CalibrationScreen(
+          mode: _isWrist ? CalibrationMode.wrist : CalibrationMode.finger,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    // La vue native lit son facteur à la création : il faut la recréer pour
+    // que la nouvelle mesure prenne effet (cf. KeyedSubtree ci-dessous).
+    setState(() => _correction = _correctionOf(CalibrationService.current));
   }
 
   @override
@@ -55,6 +83,11 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
         backgroundColor: Colors.black87,
         foregroundColor: Colors.white,
         actions: <Widget>[
+          IconButton(
+            icon: const Icon(Icons.straighten),
+            tooltip: _isWrist ? 'Mesurer mon poignet' : 'Mesurer mon doigt',
+            onPressed: _openCalibration,
+          ),
           IconButton(
             icon: Icon(
               _debugOccluder ? Icons.visibility : Icons.visibility_off,
@@ -71,9 +104,10 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
             child: Text('Permission caméra refusée.',
                 style: TextStyle(color: Colors.white)),
           ),
-        // La clé force la recréation de la vue native quand le debug change.
+        // La clé force la recréation de la vue native quand le debug ou la
+        // calibration change (les deux sont lus à la création de la vue).
         true => KeyedSubtree(
-            key: ValueKey<bool>(_debugOccluder),
+            key: ValueKey<String>('$_debugOccluder/$_correction'),
             child: _buildHybridView(),
           ),
       },
@@ -88,6 +122,7 @@ class _NativeArTestScreenState extends State<NativeArTestScreen> {
       'assetPath': widget.assetPath,
       'anchor': widget.anchor,
       'debugOccluder': _debugOccluder,
+      'scaleCorrection': _correction,
     };
     return PlatformViewLink(
       viewType: _viewType,
