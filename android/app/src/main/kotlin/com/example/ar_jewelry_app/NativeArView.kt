@@ -161,6 +161,12 @@ class NativeArView(
     // Correction latérale lissée vers le centre mesuré du bras (rendu seul).
     private var segOff = 0f
 
+    // Axe médio-latéral du poignet (colX du bijou) déduit de la silhouette
+    // mesurée, lissé dans le temps (rendu seul). null = pas encore mesuré →
+    // repli sur la normale de paume. Voir le bloc "roulis" de
+    // updateModelTransform pour le pourquoi.
+    private var smoothRoll: FloatArray? = null
+
     // Position brute (espace image MediaPipe) du poignet détecté par la main,
     // pour choisir le bon bras côté pose (gauche/droite).
     @Volatile
@@ -344,6 +350,7 @@ class NativeArView(
             // À la prochaine acquisition, l'échelle repart de la mesure.
             smoothScale = 0f
             segOff = 0f
+            smoothRoll = null
             return
         }
         // Demi-étendue du monde visible au plan du modèle (z=0), à distance
@@ -447,20 +454,85 @@ class NativeArView(
             fallback = anyPerpendicular(axis),
         )
 
+        // --- Roulis du bracelet contraint par la silhouette MESURÉE ---------
+        // La normale de paume est la mesure la plus bruitée du pipeline (d'où
+        // fNorm à minCutoff 0.35) et surtout elle est mal CONTRAINTE quand la
+        // main est à plat face caméra : les deux bords lm0→lm5 et lm0→lm17
+        // sont alors presque colinéaires en projection, leur produit vectoriel
+        // part au bruit et le bracelet pivote autour de l'avant-bras.
+        //
+        // Le masque de segmentation donne bien mieux : le vecteur pleine
+        // largeur de la silhouette EST la projection écran de l'axe
+        // médio-latéral du poignet — le grand axe de son ellipse. On impose
+        // donc colX (la largeur du bijou) le long de ce vecteur, et on ne
+        // garde de la normale de paume que le SIGNE (quelle face regarde la
+        // caméra). Mesure directe plutôt qu'estimation dérivée.
+        if (anchor == "wrist" && segFresh) {
+            // seg[2..3] : écran normalisé, Y vers le BAS → monde : Y inversé.
+            val u = floatArrayOf(seg!![2] * 2f * halfW, -seg[3] * 2f * halfH, 0f)
+            // Composante orthogonale à l'axe du bras (le grand axe de
+            // l'ellipse est perpendiculaire à l'avant-bras par construction,
+            // mais la mesure et l'axe viennent de deux détecteurs différents).
+            val du = axis[0] * u[0] + axis[1] * u[1] + axis[2] * u[2]
+            val o = floatArrayOf(
+                u[0] - du * axis[0],
+                u[1] - du * axis[1],
+                u[2] - du * axis[2],
+            )
+            if (sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]) > kMinRollNorm) {
+                var c = normalized(o, fallback = floatArrayOf(1f, 0f, 0f))
+                // Lever l'ambiguïté ±180° de l'axe de largeur : garder le sens
+                // qui met la face avant du bijou (cross(colX, axe)) côté caméra.
+                if (cross(c, axis)[2] < 0f) c = floatArrayOf(-c[0], -c[1], -c[2])
+                val sm = smoothRoll
+                smoothRoll = if (sm == null) {
+                    c
+                } else {
+                    normalized(
+                        floatArrayOf(
+                            sm[0] + kRollLerp * (c[0] - sm[0]),
+                            sm[1] + kRollLerp * (c[1] - sm[1]),
+                            sm[2] + kRollLerp * (c[2] - sm[2]),
+                        ),
+                        fallback = c,
+                    )
+                }
+            }
+        }
+
         // Convention des modèles Meshy (cf. mémoire projet) :
         //  - bague : axe du trou = +Z modèle, pierre = +Y → Z→doigt, Y→dos de main ;
         //  - bracelet : axe du trou = +Y modèle → Y→avant-bras, Z→caméra.
         // Le tangage +90° appliqué en V1 est absorbé par ce mapping direct.
+        val colX: FloatArray
         val colY: FloatArray
         val colZ: FloatArray
-        if (anchor == "wrist") {
+        val roll = if (anchor == "wrist") smoothRoll else null
+        if (roll != null) {
+            // Base pilotée par la silhouette : colX = largeur mesurée du
+            // poignet, ré-orthogonalisée (l'axe du bras a pu bouger depuis la
+            // dernière mesure de masque, qui tourne ~2× moins vite).
             colY = axis
-            colZ = norm
+            val dr = axis[0] * roll[0] + axis[1] * roll[1] + axis[2] * roll[2]
+            colX = normalized(
+                floatArrayOf(
+                    roll[0] - dr * axis[0],
+                    roll[1] - dr * axis[1],
+                    roll[2] - dr * axis[2],
+                ),
+                fallback = cross(axis, norm),
+            )
+            colZ = cross(colX, colY)
         } else {
-            colY = norm
-            colZ = axis
+            if (anchor == "wrist") {
+                colY = axis
+                colZ = norm
+            } else {
+                colY = norm
+                colZ = axis
+            }
+            colX = cross(colY, colZ)
         }
-        val colX = cross(colY, colZ)
 
         // Colonne-major : m = T · R · S.
         val m = floatArrayOf(
@@ -480,6 +552,8 @@ class NativeArView(
                     "(${if (segFresh) "mesuré masque" else "estimé main"}) " +
                     "recentrage=$segOff " +
                     "axe=(${axis[0]}, ${axis[1]}, ${axis[2]}) " +
+                    "roulis=${if (roll != null) "silhouette" else "normale paume"} " +
+                    "colX=(${colX[0]}, ${colX[1]}, ${colX[2]}) " +
                     "norm=(${norm[0]}, ${norm[1]}, ${norm[2]}) pos=($wx, $wy)",
             )
         }
@@ -1310,6 +1384,16 @@ class NativeArView(
 
         /** Profondeur du poignet / largeur (ellipse anatomique aplatie). */
         private const val kWristDepthRatio = 0.70f
+
+        /** Norme min de la composante du vecteur silhouette orthogonale à
+         *  l'axe du bras (unités monde) pour en tirer un roulis : en dessous,
+         *  la mesure est quasi colinéaire à l'axe → direction indéterminée. */
+        private const val kMinRollNorm = 0.05f
+
+        /** Lissage du roulis mesuré (fraction/frame) : le masque n'est
+         *  ré-évalué qu'une frame d'analyse sur deux, la boucle de rendu
+         *  tourne à 60 fps → convergence douce, sans à-coups d'orientation. */
+        private const val kRollLerp = 0.10f
 
         /** Sous cette fraction "dans le plan écran" de l'axe, on arrête de
          *  compenser le raccourcissement de perspective (protège des
