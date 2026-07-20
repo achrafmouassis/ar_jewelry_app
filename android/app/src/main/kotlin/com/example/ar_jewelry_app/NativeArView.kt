@@ -153,8 +153,15 @@ class NativeArView(
     // du Pose Landmarker (comme les essayages commerciaux : masque temps réel
     // → largeur exacte du poignet). [midX, midY, dX, dY] en espace écran
     // normalisé : centre du bras + vecteur pleine largeur de la silhouette.
+    // Deux points de mesure le long de l'avant-bras : la MANCHETTE est haute
+    // (bande de 1.85 unité pour un Ø intérieur de 1.30, soit ~9 cm de bras
+    // couvert) et l'avant-bras s'évase justement sur cette longueur. Un rayon
+    // unique la ferait mordre dans la chair d'un bout et flotter de l'autre.
+    // Deux largeurs → évasement → rayon évalué au centre RÉEL de la bande.
     @Volatile
     private var wristSeg: FloatArray? = null
+    @Volatile
+    private var wristSegFar: FloatArray? = null
     @Volatile
     private var wristSegMs = 0L
 
@@ -437,13 +444,50 @@ class NativeArView(
         // réel de l'utilisateur, la corriger la fausserait. Seul le repli
         // anatomique (ratio de population) et l'échelle de la bague (dérivée
         // de la taille de main du modèle générique) en ont besoin.
+        //
+        // ÉVASEMENT : la manchette est haute (2×kBandHalfHeight ≈ 9 cm de
+        // bras) et l'avant-bras s'élargit sur cette longueur. Le rayon lu au
+        // point de mesure proche n'est donc PAS celui qu'il faut au centre de
+        // la bande, plus bas vers le coude. Deux largeurs mesurées donnent la
+        // pente ; on évalue le rayon là où la bande se trouve réellement.
+        val segFar = wristSegFar
+        var taper = 0f // rayon gagné par unité monde vers le coude
+        var rNearAlong = 0f // distance ancre → point proche, le long de -axis
+        if (segFresh && segFar != null && anchor == "wrist") {
+            val rN = 0.5f * hypot(seg!![2] * 2f * halfW, seg[3] * 2f * halfH)
+            val rF = 0.5f * hypot(segFar[2] * 2f * halfW, segFar[3] * 2f * halfH)
+            // Positions monde des deux points de mesure.
+            val nX = (seg[0] - 0.5f) * 2f * halfW
+            val nY = (0.5f - seg[1]) * 2f * halfH
+            val fX2 = (segFar[0] - 0.5f) * 2f * halfW
+            val fY2 = (0.5f - segFar[1]) * 2f * halfH
+            // Écart le long de l'axe, compté vers le COUDE (-axis).
+            val d = -((fX2 - nX) * axis[0] + (fY2 - nY) * axis[1])
+            if (d > kMinTaperSpan) {
+                taper = ((rF - rN) / d).coerceIn(0f, kMaxTaper)
+                rNearAlong = -((nX - (aX - 0.5f) * 2f * halfW) * axis[0] +
+                    (nY - (0.5f - aY) * 2f * halfH) * axis[1])
+            }
+        }
+
         val worldWristRadius = if (segFresh) {
             0.5f * hypot(seg!![2] * 2f * halfW, seg[3] * 2f * halfH)
         } else {
             0.5f * kWristWidthPerHand * worldHandLen * scaleCorrection
         }
         val sRaw = if (anchor == "wrist") {
-            worldWristRadius * kBraceletClearance / kModelInnerRadius
+            // Le rayon voulu est celui au CENTRE de la bande, situé à
+            // s·(kBandHalfHeight + kBandGap) vers le coude — mais ce centre
+            // dépend de s, qui dépend du rayon. Plutôt que d'itérer :
+            //   r = rProche + taper·(dAncre→proche + s·B)
+            //   s = A·r,  A = clearance/rayonModèle,  B = demi-hauteur + jeu
+            //   ⟹ s = A·(rProche + taper·dAncre→proche) / (1 − A·taper·B)
+            // Le dénominateur ne s'annule que pour un évasement absurde, déjà
+            // borné par kMaxTaper ; garde-fou malgré tout.
+            val a = kBraceletClearance / kModelInnerRadius
+            val b = kBandHalfHeight + kBandGap
+            val denom = (1f - a * taper * b).coerceAtLeast(kMinTaperDenom)
+            a * (worldWristRadius + taper * rNearAlong) / denom
         } else {
             worldHandLen * kRingPerHand * scaleCorrection
         }
@@ -566,6 +610,7 @@ class NativeArView(
                     "halfH=$halfH s=$s handLen=$worldHandLen planar=$planar " +
                     "poignetR=$worldWristRadius " +
                     "(${if (segFresh) "mesuré masque" else "estimé main"}) " +
+                    "évasement=$taper dAncreProche=$rNearAlong " +
                     "recentrage=$segOff " +
                     "axe=(${axis[0]}, ${axis[1]}, ${axis[2]}) " +
                     "roulis=${if (roll != null) "silhouette" else "normale paume"} " +
@@ -815,74 +860,84 @@ class NativeArView(
                 return fb.get(yi * mw + xi)
             }
 
-            // Point de mesure : légèrement côté avant-bras, là où se porte
-            // le bracelet (cohérent avec l'offset d'ancrage de onHands).
             val wl = lm[wristIdx]
             val el = lm[elbowIdx]
-            val cxN = wl.x() + (el.x() - wl.x()) * kScanTowardElbow
-            val cyN = wl.y() + (el.y() - wl.y()) * kScanTowardElbow
+            // La convention d'espace du masque est sondée au point PROCHE
+            // (toujours sur le bras si la détection est bonne).
+            val nx = wl.x() + (el.x() - wl.x()) * kScanNear
+            val ny = wl.y() + (el.y() - wl.y()) * kScanNear
             val rawMode: Boolean? = when {
-                sample(cxN, cyN, false) >= 0.5f -> false
-                sample(cxN, cyN, true) >= 0.5f -> true
+                sample(nx, ny, false) >= 0.5f -> false
+                sample(nx, ny, true) >= 0.5f -> true
                 else -> null
             }
-            var segW = -1f
-            if (rawMode != null) {
-                // Direction avant-bras en pixels masque (anisotropie
-                // corrigée), pas de balayage = 1 pixel.
-                var fxp = (wl.x() - el.x()) * mw
-                var fyp = (wl.y() - el.y()) * mh
-                val fl = hypot(fxp, fyp)
-                if (fl > 1e-3f) {
-                    fxp /= fl
-                    fyp /= fl
-                    val stepX = -fyp / mw
-                    val stepY = fxp / mh
-                    val maxSteps = (kSegMaxWidthFrac * maxOf(mw, mh)).toInt()
-                    fun march(sign: Int): Int {
-                        var miss = 0
-                        var i = 1
-                        while (i <= maxSteps) {
-                            val v = sample(
-                                cxN + sign * i * stepX,
-                                cyN + sign * i * stepY,
-                                rawMode,
-                            )
-                            if (v < 0.5f) {
-                                if (++miss >= 3) return i - miss
-                            } else {
-                                miss = 0
-                            }
-                            i++
-                        }
-                        return maxSteps
-                    }
-                    val dPlus = march(1)
-                    val dMinus = march(-1)
-                    // Bord non trouvé d'un côté = balayage parti dans le
-                    // corps/l'autre bras → mesure rejetée.
-                    if (dPlus < maxSteps && dMinus < maxSteps) {
-                        val e1 = toScr(cxN + dPlus * stepX, cyN + dPlus * stepY, useRot)
-                        val e2 = toScr(cxN - dMinus * stepX, cyN - dMinus * stepY, useRot)
-                        val segV = floatArrayOf(
-                            (e1[0] + e2[0]) * 0.5f,
-                            (e1[1] + e2[1]) * 0.5f,
-                            e1[0] - e2[0],
-                            e1[1] - e2[1],
+
+            // Direction avant-bras en pixels masque (anisotropie corrigée),
+            // pas de balayage = 1 pixel.
+            val fxp = (wl.x() - el.x()) * mw
+            val fyp = (wl.y() - el.y()) * mh
+            val fl = hypot(fxp, fyp)
+
+            /** Pleine largeur de la silhouette à [frac] le long de
+             *  poignet→coude, en espace écran : [midX, midY, dX, dY].
+             *  null = bord non trouvé (balayage parti dans le torse ou
+             *  l'autre bras) ou largeur invraisemblable. */
+            fun measureAt(frac: Float): FloatArray? {
+                if (rawMode == null || fl <= 1e-3f) return null
+                val cxN = wl.x() + (el.x() - wl.x()) * frac
+                val cyN = wl.y() + (el.y() - wl.y()) * frac
+                val stepX = -(fyp / fl) / mw
+                val stepY = (fxp / fl) / mh
+                val maxSteps = (kSegMaxWidthFrac * maxOf(mw, mh)).toInt()
+                fun march(sign: Int): Int {
+                    var miss = 0
+                    var i = 1
+                    while (i <= maxSteps) {
+                        val v = sample(
+                            cxN + sign * i * stepX,
+                            cyN + sign * i * stepY,
+                            rawMode,
                         )
-                        segW = hypot(segV[2], segV[3])
-                        if (segW in kSegMinWidthN..kSegMaxWidthN) {
-                            wristSeg = segV
-                            wristSegMs = SystemClock.uptimeMillis()
+                        if (v < 0.5f) {
+                            if (++miss >= 3) return i - miss
+                        } else {
+                            miss = 0
                         }
+                        i++
                     }
+                    return maxSteps
                 }
+                val dPlus = march(1)
+                val dMinus = march(-1)
+                if (dPlus >= maxSteps || dMinus >= maxSteps) return null
+                val e1 = toScr(cxN + dPlus * stepX, cyN + dPlus * stepY, useRot)
+                val e2 = toScr(cxN - dMinus * stepX, cyN - dMinus * stepY, useRot)
+                val v = floatArrayOf(
+                    (e1[0] + e2[0]) * 0.5f,
+                    (e1[1] + e2[1]) * 0.5f,
+                    e1[0] - e2[0],
+                    e1[1] - e2[1],
+                )
+                val w = hypot(v[2], v[3])
+                return if (w in kSegMinWidthN..kSegMaxWidthN) v else null
+            }
+
+            val near = measureAt(kScanNear)
+            if (near != null) {
+                wristSeg = near
+                // La mesure lointaine sert au seul évasement : elle peut
+                // échouer (manche, bras hors cadre) sans invalider la proche.
+                wristSegFar = measureAt(kScanFar)
+                wristSegMs = SystemClock.uptimeMillis()
             }
             if (poseLogCount % 15 == 0) {
+                val nw = near?.let { hypot(it[2], it[3]) } ?: -1f
+                val fw = wristSegFar?.let { hypot(it[2], it[3]) } ?: -1f
                 Log.i(
                     TAG,
-                    "seg: mode=${rawMode ?: "hors masque"} largeur=$segW " +
-                        "centre=(${wristSeg?.get(0)}, ${wristSeg?.get(1)}) " +
+                    "seg: mode=${rawMode ?: "hors masque"} " +
+                        "largeurProche=$nw largeurLoin=$fw " +
+                        "centre=(${near?.get(0)}, ${near?.get(1)}) " +
                         "masque=${mw}x$mh",
                 )
             }
@@ -1362,10 +1417,25 @@ class NativeArView(
         /** Fraîcheur max de la mesure silhouette avant repli anatomique. */
         private const val kSegFreshMs = 400L
 
-        /** Point de mesure de la largeur : fraction de l'axe poignet→coude —
-         *  sous la zone où la manchette se porte réellement (son bord haut
-         *  affleure le pli, son corps descend sur l'avant-bras). */
-        private const val kScanTowardElbow = 0.25f
+        /** Points de mesure de la largeur, en fraction de l'axe
+         *  poignet→coude. Deux mesures : le rayon au bord haut de la
+         *  manchette (proche) et l'évasement de l'avant-bras (loin). */
+        private const val kScanNear = 0.10f
+        private const val kScanFar = 0.45f
+
+        /** Écart min (unités monde) entre les deux points de mesure projetés
+         *  sur l'axe pour en tirer une pente : en dessous, le bras pointe
+         *  vers la caméra et l'évasement mesuré serait du bruit amplifié. */
+        private const val kMinTaperSpan = 0.15f
+
+        /** Évasement max accepté (rayon gagné par unité monde vers le coude).
+         *  Un avant-bras réel reste bien en dessous ; au-delà, la mesure
+         *  lointaine a fui dans le coude ou le torse. */
+        private const val kMaxTaper = 0.25f
+
+        /** Plancher du dénominateur de la résolution en fermé de l'échelle
+         *  (voir sRaw) : borne la boucle rayon → échelle → position. */
+        private const val kMinTaperDenom = 0.5f
 
         /** Demi-hauteur de la manchette le long de son axe, unités modèle
          *  (profil GLB mesuré : bande pleine de Y=-0.92 à +0.92, rayon
