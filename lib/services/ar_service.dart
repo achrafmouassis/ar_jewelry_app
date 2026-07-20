@@ -262,17 +262,22 @@ class ARService {
     final double dirZ;       // <0 = pointe vers la caméra
     if (anchor == AnchorPoint.wrist) {
       // Le landmark 0 est au pli du poignet (base de la paume) ; un bracelet
-      // se porte 2-3 cm plus bas sur l'avant-bras → on décale l'ancre de
-      // 30 % de la longueur de la main à l'opposé des doigts.
-      tx = wrist.dx - (middleMcp.dx - wrist.dx) * 0.30;
-      ty = wrist.dy - (middleMcp.dy - wrist.dy) * 0.30;
+      // se porte 3-4 cm plus bas sur l'avant-bras → on décale l'ancre de
+      // 40 % de la longueur de la main à l'opposé des doigts. (L'offset
+      // suit l'axe projeté du bras : il raccourcit naturellement avec la
+      // perspective quand le bras s'incline.)
+      tx = wrist.dx - (middleMcp.dx - wrist.dx) * 0.40;
+      ty = wrist.dy - (middleMcp.dy - wrist.dy) * 0.40;
       dirX = middleMcp.dx - wrist.dx;
       dirY = (middleMcp.dy - wrist.dy) * _frameAspect;
       dirZ = lm[9].z - lm[0].z;
     } else {
-      // milieu entre 13 et 14 → emplacement naturel d'une bague
-      tx = (ringMcp.dx + ringPip.dx) / 2;
-      ty = (ringMcp.dy + ringPip.dy) / 2;
+      // Base de l'annulaire, à 55 % entre MCP (13) et PIP (14) : le
+      // landmark MCP est dans la chair de la paume, pas à la surface du
+      // doigt — l'ancre remonte donc légèrement au-delà du milieu pour
+      // que l'anneau tombe visuellement sur la phalange.
+      tx = ringMcp.dx + (ringPip.dx - ringMcp.dx) * 0.55;
+      ty = ringMcp.dy + (ringPip.dy - ringMcp.dy) * 0.55;
       dirX = ringPip.dx - ringMcp.dx;
       dirY = (ringPip.dy - ringMcp.dy) * _frameAspect;
       dirZ = lm[14].z - lm[13].z;
@@ -307,10 +312,11 @@ class ARService {
     // Anatomie visée :
     //   bague : diamètre ≈ 1,15× l'écart MCP majeur-annulaire
     //           → widget = 1,15 / 0,80 ≈ 1,5 × fingerW ;
-    //   bracelet : poignet visible ≈ 0,9× la paume, jonc = 1,2× le poignet
-    //           → widget = 1,08 / 0,70 ≈ 1,5 × palmW.
+    //   bracelet : poignet visible ≈ 0,9× la paume, jonc = 1,3× le poignet
+    //           (il déborde nettement, c'est ce qui "englobe")
+    //           → widget = 1,17 / 0,70 ≈ 1,65 × palmW.
     final double scale = anchor == AnchorPoint.wrist
-        ? (palmW * 1.5).clamp(0.15, 0.80)
+        ? (palmW * 1.65).clamp(0.15, 0.85)
         : (fingerW * 1.5).clamp(0.08, 0.40);
 
     // Rotation : aligne le "haut" du modèle avec la direction du doigt
@@ -469,13 +475,33 @@ class _AnchorSmoother {
   final _OneEuroFilter _y = _OneEuroFilter(minCutoff: 1.2, beta: 0.02);
   final _OneEuroFilter _scale = _OneEuroFilter(minCutoff: 0.8, beta: 0.01);
   final _OneEuroFilter _rot = _OneEuroFilter(minCutoff: 1.0, beta: 0.01);
-  // La profondeur MediaPipe (z) est plus bruitée que x/y → cutoff plus bas.
-  final _OneEuroFilter _tilt = _OneEuroFilter(minCutoff: 0.6, beta: 0.005);
+  // La profondeur MediaPipe (z) est plus bruitée que x/y → cutoff plus bas,
+  // mais assez réactif pour que le bijou pivote avec la main sans traîner.
+  final _OneEuroFilter _tilt = _OneEuroFilter(minCutoff: 0.8, beta: 0.01);
+
+  /// Avance temporelle (s) pour la compensation de latence : on projette la
+  /// position selon la vitesse lissée pour que le bijou reste "collé" à la
+  /// main en mouvement au lieu de traîner derrière. Calé sur la latence
+  /// mesurée du pipeline (~throttle 66 ms + détection + rendu).
+  static const double _leadSeconds = 0.09;
+
+  /// Déplacement prédictif max (unités normalisées) : borne l'extrapolation
+  /// pour éviter tout dépassement lors des changements brusques de direction.
+  static const double _maxLead = 0.06;
 
   AnchorResult apply(AnchorResult r) {
     final int t = DateTime.now().millisecondsSinceEpoch;
+    final double fx = _x.filter(r.position.dx, t);
+    final double fy = _y.filter(r.position.dy, t);
+    // Extrapolation : position filtrée + vitesse lissée × avance, bornée.
+    final double px =
+        (fx + (_x.velocity * _leadSeconds).clamp(-_maxLead, _maxLead))
+            .clamp(0.0, 1.0);
+    final double py =
+        (fy + (_y.velocity * _leadSeconds).clamp(-_maxLead, _maxLead))
+            .clamp(0.0, 1.0);
     return AnchorResult(
-      position: Offset(_x.filter(r.position.dx, t), _y.filter(r.position.dy, t)),
+      position: Offset(px, py),
       scale: _scale.filter(r.scale, t),
       rotationRadians: _rot.filter(r.rotationRadians, t),
       tiltRadians: _tilt.filter(r.tiltRadians, t),
@@ -504,6 +530,11 @@ class _OneEuroFilter {
   double? _xPrev;
   double? _dxPrev;
   int? _tPrev; // ms
+
+  /// Vitesse lissée courante (unités/seconde), utilisée pour extrapoler la
+  /// position et masquer la latence du pipeline (throttle + MediaPipe async
+  /// + compositing WebView). 0 tant qu'aucune donnée n'est arrivée.
+  double get velocity => _dxPrev ?? 0.0;
 
   _OneEuroFilter({
     this.minCutoff = 1.0,

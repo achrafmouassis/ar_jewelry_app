@@ -337,12 +337,27 @@ class _ARViewScreenState extends State<ARViewScreen>
             ValueListenableBuilder<AnchorResult?>(
               valueListenable: _anchor,
               child: IgnorePointer(
-                child: _JewelryGlbView(
-                  assetPath: _arAssetPath,
-                  orientation: TrackingConfig.orientationFor(
-                      widget.jewelry.type.folder),
-                  onWebViewCreated: (WebViewController c) =>
-                      _mvController = c,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: <Widget>[
+                    // Ombre de contact : léger assombrissement de la peau
+                    // sous le métal. Sans elle le bijou "flotte" — c'est
+                    // l'indice n°1 d'une incrustation pour l'œil. Rendue
+                    // SOUS la WebView (transparente), elle suit les mêmes
+                    // transformations rotation/échelle que le modèle.
+                    _ContactShadow(
+                      wide: TrackingConfig.anchorFor(
+                              widget.jewelry.type.folder) ==
+                          AnchorPoint.wrist,
+                    ),
+                    _JewelryGlbView(
+                      assetPath: _arAssetPath,
+                      orientation: TrackingConfig.orientationFor(
+                          widget.jewelry.type.folder),
+                      onWebViewCreated: (WebViewController c) =>
+                          _mvController = c,
+                    ),
+                  ],
                 ),
               ),
               builder: (BuildContext _, AnchorResult? r, Widget? child) {
@@ -406,6 +421,36 @@ class _ARViewScreenState extends State<ARViewScreen>
           ],
         );
       },
+    );
+  }
+}
+
+/// Ombre de contact douce derrière le bijou : ellipse floue sombre couvrant
+/// la zone du métal. [wide] adapte les proportions (bracelet = large et
+/// haut, bague = compacte autour de la pierre).
+class _ContactShadow extends StatelessWidget {
+  final bool wide;
+  const _ContactShadow({required this.wide});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: FractionallySizedBox(
+        widthFactor: wide ? 0.72 : 0.55,
+        heightFactor: wide ? 0.58 : 0.42,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(999),
+            boxShadow: <BoxShadow>[
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.28),
+                blurRadius: 26,
+                spreadRadius: -6,
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
