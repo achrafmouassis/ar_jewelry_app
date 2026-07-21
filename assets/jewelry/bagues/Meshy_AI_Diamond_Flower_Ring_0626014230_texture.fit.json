@@ -1,0 +1,143 @@
+{
+  "source": "Meshy_AI_Diamond_Flower_Ring_0626014230_texture.glb",
+  "generator": "tool/fit_analyzer.dart",
+  "vertices": 198044,
+  "bbox": {
+    "min": [
+      -1.0,
+      -0.9974,
+      -0.9855
+    ],
+    "max": [
+      0.9999,
+      0.9984,
+      0.9824
+    ]
+  },
+  "holeAxis": "Z",
+  "axisHalfExtent": 0.984,
+  "axisMin": -0.9855,
+  "axisMax": 0.9824,
+  "holeCenter": [
+    0.0131,
+    -0.3213,
+    0.0
+  ],
+  "holeCenterOffset": 0.3216,
+  "holeRadius": 0.5532,
+  "holeRadiusMin": 0.5532,
+  "holeRadiusMax": 0.6981,
+  "ovality": 0.7925,
+  "radiusTowardX": 0.6293,
+  "radiusTowardY": 0.5532,
+  "openingAt": 0.9332,
+  "openingRadius": 0.5532,
+  "frontDirection": "-X",
+  "denserSide": {
+    "+X": 87849,
+    "+Y": 197470
+  },
+  "radiusProfile": [
+    {
+      "t": -0.9363,
+      "freeRadius": 0.5605,
+      "vertices": 2299
+    },
+    {
+      "t": -0.8379,
+      "freeRadius": 0.5602,
+      "vertices": 7187
+    },
+    {
+      "t": -0.7395,
+      "freeRadius": 0.5739,
+      "vertices": 8919
+    },
+    {
+      "t": -0.6411,
+      "freeRadius": 0.5923,
+      "vertices": 9657
+    },
+    {
+      "t": -0.5427,
+      "freeRadius": 0.6067,
+      "vertices": 14591
+    },
+    {
+      "t": -0.4444,
+      "freeRadius": 0.6253,
+      "vertices": 13488
+    },
+    {
+      "t": -0.346,
+      "freeRadius": 0.6396,
+      "vertices": 10089
+    },
+    {
+      "t": -0.2476,
+      "freeRadius": 0.647,
+      "vertices": 12208
+    },
+    {
+      "t": -0.1492,
+      "freeRadius": 0.6444,
+      "vertices": 13393
+    },
+    {
+      "t": -0.0508,
+      "freeRadius": 0.5596,
+      "vertices": 13269
+    },
+    {
+      "t": 0.0476,
+      "freeRadius": 0.5581,
+      "vertices": 14445
+    },
+    {
+      "t": 0.146,
+      "freeRadius": 0.645,
+      "vertices": 12027
+    },
+    {
+      "t": 0.2444,
+      "freeRadius": 0.6679,
+      "vertices": 10103
+    },
+    {
+      "t": 0.3428,
+      "freeRadius": 0.6411,
+      "vertices": 10504
+    },
+    {
+      "t": 0.4412,
+      "freeRadius": 0.625,
+      "vertices": 13476
+    },
+    {
+      "t": 0.5396,
+      "freeRadius": 0.6144,
+      "vertices": 14930
+    },
+    {
+      "t": 0.638,
+      "freeRadius": 0.5998,
+      "vertices": 7377
+    },
+    {
+      "t": 0.7364,
+      "freeRadius": 0.5676,
+      "vertices": 5193
+    },
+    {
+      "t": 0.8348,
+      "freeRadius": 0.5649,
+      "vertices": 4157
+    },
+    {
+      "t": 0.9332,
+      "freeRadius": 0.5532,
+      "vertices": 755
+    }
+  ],
+  "realInnerDiameterMm": null
+}

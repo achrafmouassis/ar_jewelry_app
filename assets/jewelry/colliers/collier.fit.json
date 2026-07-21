@@ -1,0 +1,143 @@
+{
+  "source": "collier.glb",
+  "generator": "tool/fit_analyzer.dart",
+  "vertices": 434249,
+  "bbox": {
+    "min": [
+      -0.8665,
+      -1.0,
+      -0.7023
+    ],
+    "max": [
+      0.8665,
+      1.0,
+      0.7023
+    ]
+  },
+  "holeAxis": "Y",
+  "axisHalfExtent": 1.0,
+  "axisMin": -1.0,
+  "axisMax": 1.0,
+  "holeCenter": [
+    0.0236,
+    0.0,
+    0.0309
+  ],
+  "holeCenterOffset": 0.0389,
+  "holeRadius": 0.5441,
+  "holeRadiusMin": 0.5441,
+  "holeRadiusMax": 0.7387,
+  "ovality": 0.7365,
+  "radiusTowardZ": 0.5442,
+  "radiusTowardX": 0.5701,
+  "openingAt": 0.85,
+  "openingRadius": 0.5441,
+  "frontDirection": "+Z",
+  "denserSide": {
+    "+Z": 352912,
+    "+X": 212273
+  },
+  "radiusProfile": [
+    {
+      "t": -0.95,
+      "freeRadius": 0.5659,
+      "vertices": 3667
+    },
+    {
+      "t": -0.85,
+      "freeRadius": 0.5701,
+      "vertices": 6682
+    },
+    {
+      "t": -0.75,
+      "freeRadius": 0.5704,
+      "vertices": 12181
+    },
+    {
+      "t": -0.65,
+      "freeRadius": 0.5717,
+      "vertices": 21384
+    },
+    {
+      "t": -0.55,
+      "freeRadius": 0.5732,
+      "vertices": 31623
+    },
+    {
+      "t": -0.45,
+      "freeRadius": 0.5529,
+      "vertices": 36537
+    },
+    {
+      "t": -0.35,
+      "freeRadius": 0.5503,
+      "vertices": 39484
+    },
+    {
+      "t": -0.25,
+      "freeRadius": 0.5442,
+      "vertices": 40223
+    },
+    {
+      "t": -0.15,
+      "freeRadius": 0.5571,
+      "vertices": 43133
+    },
+    {
+      "t": -0.05,
+      "freeRadius": 0.5752,
+      "vertices": 33401
+    },
+    {
+      "t": 0.05,
+      "freeRadius": 0.6535,
+      "vertices": 20936
+    },
+    {
+      "t": 0.15,
+      "freeRadius": 0.7008,
+      "vertices": 17385
+    },
+    {
+      "t": 0.25,
+      "freeRadius": 0.725,
+      "vertices": 11803
+    },
+    {
+      "t": 0.35,
+      "freeRadius": 0.7284,
+      "vertices": 9854
+    },
+    {
+      "t": 0.45,
+      "freeRadius": 0.7362,
+      "vertices": 8290
+    },
+    {
+      "t": 0.55,
+      "freeRadius": 0.6959,
+      "vertices": 8450
+    },
+    {
+      "t": 0.65,
+      "freeRadius": 0.6368,
+      "vertices": 9336
+    },
+    {
+      "t": 0.75,
+      "freeRadius": 0.5817,
+      "vertices": 14355
+    },
+    {
+      "t": 0.85,
+      "freeRadius": 0.5441,
+      "vertices": 27833
+    },
+    {
+      "t": 0.95,
+      "freeRadius": 0.5443,
+      "vertices": 37692
+    }
+  ],
+  "realInnerDiameterMm": null
+}

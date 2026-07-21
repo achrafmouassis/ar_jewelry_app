@@ -20,12 +20,16 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.google.android.filament.Camera
 import com.google.android.filament.EntityManager
+import com.google.android.filament.LightManager
+import com.google.android.filament.MaterialInstance
 import com.google.android.filament.Renderer
 import com.google.android.filament.android.UiHelper
 import com.google.android.filament.gltfio.AssetLoader
@@ -38,7 +42,9 @@ import com.google.android.filament.utils.ModelViewer
 import com.google.android.filament.utils.Utils
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.ByteBufferExtractor
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
@@ -48,8 +54,10 @@ import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import com.google.mediapipe.tasks.components.containers.Landmark
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import io.flutter.plugin.platform.PlatformView
+import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.abs
@@ -165,6 +173,15 @@ class NativeArView(
     @Volatile
     private var wristSegMs = 0L
 
+    // Largeur mesurée du COU, même format que wristSeg. Le masque personne
+    // était déjà produit pour l'écran collier (setOutputSegmentationMasks) et
+    // intégralement jeté : le collier se dimensionnait sur kNeckWidthPerShoulder,
+    // un ratio de population, alors que la mesure réelle était disponible.
+    @Volatile
+    private var neckSeg: FloatArray? = null
+    @Volatile
+    private var neckSegMs = 0L
+
     // Correction latérale lissée vers le centre mesuré du bras (rendu seul).
     private var segOff = 0f
 
@@ -210,6 +227,45 @@ class NativeArView(
         ((args as? Map<*, *>)?.get("scaleCorrection") as? Number)
             ?.toFloat()?.coerceIn(0.7f, 1.4f) ?: 1.0f
 
+    // --- Mesures du bijou -------------------------------------------------
+    // Produites hors-ligne par tool/fit_analyzer.dart et embarquées à côté du
+    // GLB. Avant, chacune de ces grandeurs était une CONSTANTE écrite à la
+    // main après une mesure jetable : ajouter un bijou imposait de refaire les
+    // mesures, et une erreur pouvait vivre des semaines sans se voir
+    // (kModelInnerRadius est resté à 0.652 pour un vrai rayon de 0.82). Elles
+    // sont désormais lues. Les constantes k* correspondantes ne servent plus
+    // que de repli, pour qu'un asset sans fit.json continue de s'afficher.
+    private val fit: JewelFit? = loadFit()
+
+    /** Centre du trou dans le repère MODÈLE : l'origine d'un GLB Meshy tombe
+     *  sur le centre de sa boîte englobante, donc à côté du trou dès que la
+     *  pièce est dissymétrique (la fleur d'une bague la décale de 0.32). */
+    private val holeCenter: FloatArray = fit?.holeCenter
+        ?: when (anchor) {
+            "wrist" -> floatArrayOf(kCuffHoleX, 0f, kCuffHoleZ)
+            "neck" -> floatArrayOf(0f, 0f, 0f)
+            else -> floatArrayOf(kRingHoleX, kRingHoleY, 0f)
+        }
+
+    /** Rayon du trou dans la direction MÉDIO-LATÉRALE (modèle X → colX).
+     *  C'est celui-là qu'il faut confronter à la largeur du membre, parce que
+     *  c'est dans cette direction-là que la segmentation la mesure. */
+    private val holeRadiusLateral: Float =
+        fit?.radiusToward("X") ?: kModelInnerRadius
+
+    /** Demi-étendue de la pièce le long de l'axe du trou. */
+    private val bandHalfHeight: Float = fit?.axisHalfExtent ?: kBandHalfHeight
+
+    /** Endroit le plus étroit le long de l'axe : c'est là que le membre
+     *  s'insère. Un plastron se porte par son ouverture haute, pas par son
+     *  milieu — d'où le décalage axial appliqué au rendu. */
+    private val openingAt: Float = fit?.openingAt ?: kNecklaceOpeningY
+    private val openingRadius: Float =
+        fit?.openingRadius ?: kNecklaceInnerRadius
+
+    /** Petit axe du trou de la bague : borne haute de son occluseur. */
+    private val ringHoleRadius: Float = fit?.holeRadiusMin ?: kRingHoleFallback
+
     // --- Filtres One-Euro (mêmes constantes que la version Dart) -----------
     private val fX = OneEuroFilter(minCutoff = 1.2f, beta = 0.02f)
     private val fY = OneEuroFilter(minCutoff = 1.2f, beta = 0.02f)
@@ -220,8 +276,17 @@ class NativeArView(
     // bijou ; le beta laisse les vraies rotations de la main passer vite.
     // La normale (roulis) est la plus bruitée des mesures (logs : dérives
     // jusqu'à l'hémisphère arrière) → lissage encore plus fort.
+    // Rapport largeur de doigt / longueur de main (cf. onHands). Fortement
+    // lissé : c'est une constante morphologique, elle ne doit pas "respirer".
+    private val fPitch = OneEuroFilter(minCutoff = 0.3f, beta = 0.005f)
+
+    @Volatile
+    private var fingerPitchRatio = 0f
+
     private val fAxis = Array(3) { OneEuroFilter(minCutoff = 0.6f, beta = 0.015f) }
     private val fNorm = Array(3) { OneEuroFilter(minCutoff = 0.35f, beta = 0.01f) }
+    // Lu par la boucle de rendu (délai de grâce), écrit par le thread analyse.
+    @Volatile
     private var lastHandMs = 0L
 
     // Dernière normale dorsale NON filtrée (thread analyse uniquement) :
@@ -235,10 +300,20 @@ class NativeArView(
     // que la PROFONDEUR (colorWrite=false). Invisible à l'écran (la caméra
     // reste visible à travers), mais tout fragment du bijou situé derrière
     // lui est masqué → la moitié arrière du bijou passe derrière la peau.
-    private var occProvider: UbershaderProvider? = null
-    private var occLoader: AssetLoader? = null
-    private var occResourceLoader: ResourceLoader? = null
+    private val auxProviders = mutableListOf<UbershaderProvider>()
+    private val auxLoaders = mutableListOf<AssetLoader>()
+    private val auxResourceLoaders = mutableListOf<ResourceLoader>()
     private var occAsset: FilamentAsset? = null
+
+    /** Jupe d'ombre de contact (cf. loadContactShadow). */
+    private var shadowAsset: FilamentAsset? = null
+
+    /** Entité de la lumière directionnelle (0 = non créée). */
+    private var sunLight = 0
+
+    /** La priorité de rendu du bijou a-t-elle pu être posée (cf. chargement
+     *  asynchrone des ressources par ModelViewer) ? */
+    private var prioritiesApplied = false
 
     // --- État partagé détection → rendu (écrit par MediaPipe, lu au rendu).
     // Position cible [0..1] en espace d'affichage, déjà lissée + extrapolée.
@@ -324,11 +399,73 @@ class NativeArView(
 
         loadModel()
         loadOccluder()
+        loadContactShadow()
         loadEnvironment()
         setupHandLandmarker()
         setupPoseLandmarker()
         startCamera(activity)
+        logStartupSummary()
         choreographer.postFrameCallback(frameCallback)
+    }
+
+    /**
+     * Récapitulatif de démarrage : un seul bloc qui dit si chaque étage du
+     * pipeline est ACTIF ou en REPLI, avec les valeurs effectivement retenues.
+     *
+     * Sans ça, diagnostiquer demandait de recouper une dizaine de lignes
+     * dispersées et d'en déduire les valeurs dérivées — ce sont justement les
+     * valeurs dérivées qui décident du rendu, pas les constantes sources.
+     */
+    private fun logStartupSummary() {
+        val f = fit
+        Log.i(TAG, "════════ ÉTAT DU PIPELINE ($anchor) ════════")
+        Log.i(
+            TAG,
+            "  bijou      : ${assetPath.substringAfterLast('/')}",
+        )
+        Log.i(
+            TAG,
+            "  ÉTAGE A fit: ${if (f != null) "ACTIF (fit.json)" else "REPLI (constantes)"}" +
+                if (f != null) {
+                    "  axe=${f.holeAxis}" +
+                        " trou=${f.holeRadiusMin}..${f.holeRadiusMax}"
+                } else {
+                    ""
+                },
+        )
+        Log.i(
+            TAG,
+            "    rayonLatéral=$holeRadiusLateral demiHauteur=$bandHalfHeight" +
+                " ouverture=$openingAt@$openingRadius trouBague=$ringHoleRadius",
+        )
+        Log.i(
+            TAG,
+            "    centreTrou=(${holeCenter[0]}, ${holeCenter[1]}, ${holeCenter[2]})" +
+                " — décalage du pivot appliqué au rendu",
+        )
+        Log.i(
+            TAG,
+            "  ÉTAGE B    : poignet=segmentation doigt=squelette3D cou=segmentation" +
+                "  calibration=$scaleCorrection",
+        )
+        Log.i(
+            TAG,
+            "  PHOTO      : soleil=${if (sunLight != 0) "OK" else "ABSENT"}" +
+                " ombre=${if (shadowAsset != null) "OK" else "ABSENTE"}" +
+                " occluseur=${if (occAsset != null) "OK" else "ABSENT"}" +
+                " debugOccluder=$debugOccluder",
+        )
+        // Vérification de cohérence des rayons : c'est l'empilement
+        // occluseur < ombre < trou qui fait que l'ombre est à moitié masquée
+        // et que le bijou entoure le membre. S'il est rompu, rien ne marche.
+        val ok = kOccluderMargin < kShadowRadiusMargin
+        Log.i(
+            TAG,
+            "  rayons     : occluseur=${kOccluderMargin}× ombre=${kShadowRadiusMargin}×" +
+                " trou=${if (anchor == "wrist") kBraceletClearance else kRingClearance}×" +
+                " (rayon du membre) → ${if (ok) "empilement cohérent" else "*** INCOHÉRENT ***"}",
+        )
+        Log.i(TAG, "══════════════════════════════════════════")
     }
 
     // --- Filament : pose complète (position + orientation + échelle) --------
@@ -337,6 +474,27 @@ class NativeArView(
         val asset = modelViewer.asset ?: return
         val tcm = modelViewer.engine.transformManager
         val inst = tcm.getInstance(asset.root)
+
+        // ModelViewer charge les ressources en asynchrone et ajoute ses
+        // renderables à la scène au fil de l'eau : au retour de loadModelGlb,
+        // la priorité a pu ne s'appliquer à rien. On réessaie jusqu'à ce
+        // qu'elle prenne — sans quoi l'ordre bijou/occluseur redeviendrait
+        // indéterminé, ce qui est exactement le bug qu'on corrige.
+        if (!prioritiesApplied) {
+            val rm = modelViewer.engine.renderableManager
+            var n = 0
+            asset.entities.forEach { e ->
+                val ri = rm.getInstance(e)
+                if (ri != 0) {
+                    rm.setPriority(ri, kPriorityJewel)
+                    n++
+                }
+            }
+            if (n > 0) {
+                prioritiesApplied = true
+                Log.i(TAG, "priorité du bijou appliquée à $n renderables")
+            }
+        }
         val vp = modelViewer.view.viewport
         if (vp.width == 0 || vp.height == 0) return
         val aspect = vp.width.toFloat() / vp.height.toFloat()
@@ -362,10 +520,22 @@ class NativeArView(
             val target = if (hasHand && segFreshNow) 0f else 1f
             guideView.alpha += kGuideFade * (target - guideView.alpha)
         }
-        if (!hasHand) {
+        // Une détection manquée ne doit PAS faire disparaître le bijou : le
+        // détecteur décroche régulièrement une frame ou deux, et un objet
+        // réellement porté ne clignote pas. On maintient donc la dernière pose
+        // connue pendant un court délai de grâce. Sans lui, chaque décrochage
+        // produisait une disparition SUIVIE d'une réapparition dont la taille
+        // reconvergeait lentement (kScaleLerp) — soit le bijou qui "regonfle",
+        // ce qui trahit l'illusion bien plus qu'une pose légèrement figée.
+        val heldMs = SystemClock.uptimeMillis() - lastHandMs
+        if (!hasHand && heldMs > kHoldAfterLossMs) {
             tcm.setTransform(inst, kHiddenTransform)
             occAsset?.let { tcm.setTransform(tcm.getInstance(it.root), kHiddenTransform) }
-            // À la prochaine acquisition, l'échelle repart de la mesure.
+            shadowAsset?.let {
+                tcm.setTransform(tcm.getInstance(it.root), kHiddenTransform)
+            }
+            // Perte durable : à la prochaine acquisition, tout repart de la
+            // mesure plutôt que de rattraper lentement une pose périmée.
             smoothScale = 0f
             segOff = 0f
             smoothRoll = null
@@ -385,9 +555,40 @@ class NativeArView(
         )
         var norm = normVec.copyOf()
 
+        // Taille de la main en unités monde (le plein écran normalisé [0..1]
+        // couvre 2·halfW × 2·halfH). La distance lm0–lm9 est mesurée à
+        // l'ÉCRAN : quand la main s'incline vers la caméra elle se raccourcit
+        // par perspective alors que le poignet garde sa largeur → on divise
+        // par la fraction de l'axe restée dans le plan écran.
+        val planar = hypot(axis[0], axis[1]).coerceAtLeast(kMinPlanarFactor)
+        val worldHandLen =
+            hypot(handDX * 2f * halfW, handDY * 2f * halfH) / planar
+
         // Mesure fraîche de la silhouette du bras (masque de segmentation) ?
         val seg = wristSeg
-        val segFresh = anchor == "wrist" && seg != null && segFreshNow
+        // Estimation anatomique (ratio de population sur un modèle de main
+        // générique, d'où la correction morphologique) : sert de repli ET de
+        // référence de vraisemblance pour la mesure du masque.
+        val anatomicalRadius =
+            0.5f * kWristWidthPerHand * worldHandLen * scaleCorrection
+        val measuredRadius = if (anchor == "wrist" && seg != null && segFreshNow) {
+            0.5f * hypot(seg[2] * 2f * halfW, seg[3] * 2f * halfH)
+        } else {
+            -1f
+        }
+        // GARDE-FOU DE VRAISEMBLANCE — mesuré sur device : le balayage du
+        // masque part parfois dans le torse ou l'autre bras et renvoie une
+        // largeur énorme (logs : rayon 1.033 contre 0.298 estimé, soit 3,5×,
+        // manchette 2,5× trop grosse d'une frame à l'autre). La borne fixe
+        // kSegMaxWidthN = 0.40 ne pouvait rien y faire : 40 % de l'écran, une
+        // fuite dans le torse passe largement en dessous. On confronte donc la
+        // mesure à l'estimation anatomique — même principe que le garde-fou
+        // pose/main sur l'axe — et on rejette ce qui s'en écarte trop. Un bras
+        // réel ne peut pas faire le double du poignet déduit de sa main.
+        val segRatio =
+            if (anatomicalRadius > 1e-4f) measuredRadius / anatomicalRadius else -1f
+        val segFresh = measuredRadius > 0f &&
+            segRatio in kSegRadiusMinRatio..kSegRadiusMaxRatio
 
         // Recentrage latéral : ramène l'ancre sur le CENTRE mesuré de la
         // silhouette du bras, perpendiculairement à l'axe seulement (le long
@@ -416,14 +617,6 @@ class NativeArView(
             }
         }
 
-        // Échelle : taille de la main en unités monde (le plein écran
-        // normalisé [0..1] couvre 2·halfW × 2·halfH). La distance lm0–lm9 est
-        // mesurée à l'ÉCRAN : quand la main s'incline vers la caméra elle se
-        // raccourcit par perspective alors que le poignet garde sa largeur →
-        // on divise par la fraction de l'axe restée dans le plan écran.
-        val planar = hypot(axis[0], axis[1]).coerceAtLeast(kMinPlanarFactor)
-        val worldHandLen =
-            hypot(handDX * 2f * halfW, handDY * 2f * halfH) / planar
         // Échelle FORTEMENT lissée : les logs montraient s oscillant de ±20 %
         // (bruit de mesure + compensation de perspective) → le bracelet
         // "respirait", ce qui casse l'illusion d'objet rigide porté. La
@@ -454,11 +647,11 @@ class NativeArView(
         var taper = 0f // rayon gagné par unité monde vers le coude
         var rNearAlong = 0f // distance ancre → point proche, le long de -axis
         if (segFresh && segFar != null && anchor == "wrist") {
-            val rN = 0.5f * hypot(seg!![2] * 2f * halfW, seg[3] * 2f * halfH)
+            val rN = measuredRadius
             val rF = 0.5f * hypot(segFar[2] * 2f * halfW, segFar[3] * 2f * halfH)
             // Positions monde des deux points de mesure.
-            val nX = (seg[0] - 0.5f) * 2f * halfW
-            val nY = (0.5f - seg[1]) * 2f * halfH
+            val nX = (seg!![0] - 0.5f) * 2f * halfW
+            val nY = (0.5f - seg!![1]) * 2f * halfH
             val fX2 = (segFar[0] - 0.5f) * 2f * halfW
             val fY2 = (0.5f - segFar[1]) * 2f * halfH
             // Écart le long de l'axe, compté vers le COUDE (-axis).
@@ -470,19 +663,43 @@ class NativeArView(
             }
         }
 
-        val worldWristRadius = if (segFresh) {
-            0.5f * hypot(seg!![2] * 2f * halfW, seg[3] * 2f * halfH)
-        } else {
-            0.5f * kWristWidthPerHand * worldHandLen * scaleCorrection
-        }
+        val worldWristRadius = if (segFresh) measuredRadius else anatomicalRadius
         // Collier : le canal "taille de main" porte la largeur d'épaules. Le
         // rayon du cou en est déduit anatomiquement, et l'échelle est posée
         // pour que l'OUVERTURE du plastron (rayon intérieur mesuré sur le
         // GLB : 0.507 unité) épouse le cou.
         val worldShoulderW = hypot(handDX * 2f * halfW, handDY * 2f * halfH)
+        // Rayon du COU : mesuré sur la silhouette quand la mesure est fraîche
+        // ET vraisemblable, sinon déduit de la largeur d'épaules par ratio
+        // anatomique. Même garde-fou que le poignet : le balayage peut fuir
+        // dans les cheveux ou le col, et une mesure fausse vaut moins qu'une
+        // estimation honnête.
+        val neckAnatomical =
+            0.5f * kNeckWidthPerShoulder * worldShoulderW * scaleCorrection
+        val nseg = neckSeg
+        val neckMeasured = if (anchor == "neck" && nseg != null &&
+            SystemClock.uptimeMillis() - neckSegMs < kSegFreshMs
+        ) {
+            0.5f * hypot(nseg[2] * 2f * halfW, nseg[3] * 2f * halfH)
+        } else {
+            -1f
+        }
+        val neckRatio =
+            if (neckAnatomical > 1e-4f) neckMeasured / neckAnatomical else -1f
+        val neckFresh = neckMeasured > 0f &&
+            neckRatio in kSegRadiusMinRatio..kSegRadiusMaxRatio
+        val worldNeckRadius = if (neckFresh) neckMeasured else neckAnatomical
+
         val sRaw = if (anchor == "neck") {
-            0.5f * kNeckWidthPerShoulder * worldShoulderW * scaleCorrection *
-                kNecklaceClearance / kNecklaceInnerRadius
+            // On confronte au rayon MINIMAL de l'ouverture, pas au rayon
+            // latéral comme pour la manchette. Différence assumée : le trou
+            // d'une manchette est ovale dans le même sens qu'un poignet et
+            // ALIGNÉ avec lui, donc comparer latéral à latéral est exact. Rien
+            // ne garantit cet alignement pour un plastron, dont l'ouverture est
+            // ovale (0.54 × 0.74) dans une direction quelconque : on prend donc
+            // la contrainte la plus serrée. Le collier sort ~5 % trop grand
+            // plutôt que de pincer le cou.
+            worldNeckRadius * kNecklaceClearance / openingRadius
         } else if (anchor == "wrist") {
             // Le rayon voulu est celui au CENTRE de la bande, situé à
             // s·(kBandHalfHeight + kBandGap) vers le coude — mais ce centre
@@ -492,12 +709,24 @@ class NativeArView(
             //   ⟹ s = A·(rProche + taper·dAncre→proche) / (1 − A·taper·B)
             // Le dénominateur ne s'annule que pour un évasement absurde, déjà
             // borné par kMaxTaper ; garde-fou malgré tout.
-            val a = kBraceletClearance / kModelInnerRadius
-            val b = kBandHalfHeight + kBandGap
+            val a = kBraceletClearance / holeRadiusLateral
+            val b = bandHalfHeight + kBandGap
             val denom = (1f - a * taper * b).coerceAtLeast(kMinTaperDenom)
             a * (worldWristRadius + taper * rNearAlong) / denom
         } else {
-            worldHandLen * kRingPerHand * scaleCorrection
+            // Bague : le trou doit épouser le DOIGT, pas une fraction
+            // arbitraire de la main. kRingPerHand = 0.12 donnait un trou à
+            // ~66 % du rayon du doigt — l'anneau était incrusté dans la chair,
+            // ce qui se lisait comme un objet flottant. Il avait été réglé
+            // « visuellement » à une époque où le pivot était décalé de 0.32 :
+            // l'erreur de taille compensait l'erreur de position.
+            val ratio = fingerPitchRatio
+            if (ratio > 0f) {
+                val fingerR = 0.5f * worldHandLen * ratio * scaleCorrection
+                kRingClearance * fingerR / holeRadiusLateral
+            } else {
+                worldHandLen * kRingPerHand * scaleCorrection
+            }
         }
         smoothScale = if (smoothScale <= 0f) sRaw
         else smoothScale + kScaleLerp * (sRaw - smoothScale)
@@ -518,8 +747,8 @@ class NativeArView(
         // 0.90×s sous le creux sternal : l'ouverture y affleure et la pièce
         // retombe sur la poitrine.
         val alongOff = when (anchor) {
-            "wrist" -> s * (kBandHalfHeight + kBandGap)
-            "neck" -> s * kNecklaceOpeningY
+            "wrist" -> s * (bandHalfHeight + kBandGap)
+            "neck" -> s * openingAt
             else -> 0f
         }
         val wx = (aX - 0.5f) * 2f * halfW - axis[0] * alongOff
@@ -618,12 +847,33 @@ class NativeArView(
             colX = cross(colY, colZ)
         }
 
+        // --- Recentrage du PIVOT sur le centre du TROU ----------------------
+        // L'origine d'un GLB Meshy tombe sur le centre de sa boîte englobante,
+        // PAS sur le centre du trou : dès que la pièce est dissymétrique, les
+        // deux divergent. Mesuré (plus grand cylindre vide traversant, centre
+        // optimisé, cf. scripts d'analyse) :
+        //   - bague : trou décalé de 0.327 unité vers -Y, soit 59 % du rayon
+        //     de son propre trou — la fleur tire la boîte englobante vers le
+        //     haut, donc le doigt tombait franchement hors de l'axe du trou ;
+        //   - manchette : 0.054, plus modeste mais du même mécanisme.
+        // On compose donc une translation MODÈLE de −centreDuTrou, ce qui
+        // revient à poser m = T · R · S · Translate(−h).
+        // Le fit.json donne le centre du trou avec sa composante AXIALE déjà à
+        // zéro : le décalage le long de l'axe est porté séparément par
+        // alongOff, qui dépend de l'échelle.
+        val hX = holeCenter[0]
+        val hY = holeCenter[1]
+        val hZ = holeCenter[2]
+        val tx = wx - s * (colX[0] * hX + colY[0] * hY + colZ[0] * hZ)
+        val ty = wy - s * (colX[1] * hX + colY[1] * hY + colZ[1] * hZ)
+        val tz = -s * (colX[2] * hX + colY[2] * hY + colZ[2] * hZ)
+
         // Colonne-major : m = T · R · S.
         val m = floatArrayOf(
             colX[0] * s, colX[1] * s, colX[2] * s, 0f,
             colY[0] * s, colY[1] * s, colY[2] * s, 0f,
             colZ[0] * s, colZ[1] * s, colZ[2] * s, 0f,
-            wx, wy, 0f, 1f,
+            tx, ty, tz, 1f,
         )
         tcm.setTransform(inst, m)
 
@@ -634,6 +884,21 @@ class NativeArView(
                     "halfH=$halfH s=$s handLen=$worldHandLen planar=$planar " +
                     "poignetR=$worldWristRadius " +
                     "(${if (segFresh) "mesuré masque" else "estimé main"}) " +
+                    "mesuré=$measuredRadius estimé=$anatomicalRadius " +
+                    "rapport=$segRatio " +
+                    (if (anchor == "neck") {
+                        "cou=$worldNeckRadius " +
+                            "(${if (neckFresh) "mesuré masque" else "estimé épaules"}) " +
+                            "rapportCou=$neckRatio "
+                    } else {
+                        ""
+                    }) +
+                    (if (anchor != "wrist" && anchor != "neck") {
+                        "doigt/main=$fingerPitchRatio " +
+                            "(${if (fingerPitchRatio > 0f) "mesuré" else "repli kRingPerHand"}) "
+                    } else {
+                        ""
+                    }) +
                     "évasement=$taper dAncreProche=$rNearAlong " +
                     "recentrage=$segOff " +
                     "axe=(${axis[0]}, ${axis[1]}, ${axis[2]}) " +
@@ -643,21 +908,27 @@ class NativeArView(
             )
         }
 
+        // Axe du trou du bijou dans le repère de rendu, et direction radiale
+        // qui l'accompagne. Partagé par l'occluseur et l'ombre de contact :
+        // les deux sont des cylindres dont l'axe EST celui du membre.
+        val limbAxis: FloatArray
+        val limbRadial: FloatArray
+        if (anchor == "wrist" || anchor == "neck") {
+            limbAxis = colY
+            limbRadial = colZ
+        } else {
+            limbAxis = colZ
+            limbRadial = colY
+        }
+
         // --- Occluseur : cylindre aligné sur l'axe du trou du bijou, aux
         // dimensions du membre (ellipse du poignet / cylindre du doigt).
         val occ = occAsset
         if (occ != null) {
             // Axe du cylindre (Y du modèle occluseur) = axe du trou ; les
             // deux autres colonnes portent les rayons radiaux.
-            val axisDir: FloatArray
-            val radial: FloatArray
-            if (anchor == "wrist" || anchor == "neck") {
-                axisDir = colY
-                radial = colZ
-            } else {
-                axisDir = colZ
-                radial = colY
-            }
+            val axisDir = limbAxis
+            val radial = limbRadial
             // Bracelet : l'occluseur représente le POIGNET RÉEL (ellipse
             // anatomique), plus le bijou — il est dimensionné sur le rayon du
             // poignet (retrouvé depuis l'échelle lissée pour rester
@@ -671,18 +942,19 @@ class NativeArView(
                 // Le cou masque l'arrière du collier. Rayon retrouvé depuis
                 // l'échelle (donc rigidement solidaire de la pièce), section
                 // légèrement aplatie d'avant en arrière comme un vrai cou.
-                r1 = s * kNecklaceInnerRadius / kNecklaceClearance *
-                    kOccluderMargin
+                r1 = s * openingRadius / kNecklaceClearance * kOccluderMargin
                 r2 = r1 * kNeckDepthRatio
                 len = s * kNeckOccLen
             } else if (anchor == "wrist") {
-                val wristR = s * kModelInnerRadius / kBraceletClearance
+                val wristR = s * holeRadiusLateral / kBraceletClearance
                 r1 = wristR * kOccluderMargin
                 r2 = r1 * kWristDepthRatio
                 len = s * kWristOccLen
             } else {
-                r1 = s * kRingOccRadius
-                r2 = s * kRingOccRadius
+                // Doit rester SOUS le petit axe du trou, sinon le cylindre de
+                // profondeur déborde de l'anneau et masque la bague elle-même.
+                r1 = s * ringHoleRadius * kRingOccInset
+                r2 = r1
                 len = s * kRingOccLen
             }
             // L'occluseur suit le MEMBRE, pas l'origine du modèle. Pour la
@@ -690,15 +962,63 @@ class NativeArView(
             // l'origine a été descendue de alongOff sous le creux sternal,
             // alors que le cou à masquer est au-dessus → on remonte.
             val occRise = if (anchor == "neck") alongOff + s * kNeckOccRise else 0f
+            // Le membre passe par le CENTRE DU TROU, qui est en (wx, wy, 0) par
+            // construction — c'est précisément ce que le recentrage garantit.
+            // PAS par (tx, ty, tz), qui est l'endroit où l'on pose l'ORIGINE DU
+            // GLB pour que le trou tombe au bon endroit. Les deux diffèrent de
+            // s·R·holeCenter, soit la moitié du rayon du doigt pour la bague
+            // (holeCenter.y = -0.32) : l'occluseur se retrouvait à moitié hors
+            // du membre qu'il est censé représenter.
             val ox = wx + axis[0] * occRise
             val oy = wy + axis[1] * occRise
+            val oz = axis[2] * occRise
             val om = floatArrayOf(
                 colX[0] * r1, colX[1] * r1, colX[2] * r1, 0f,
                 axisDir[0] * len, axisDir[1] * len, axisDir[2] * len, 0f,
                 radial[0] * r2, radial[1] * r2, radial[2] * r2, 0f,
-                ox, oy, 0f, 1f,
+                ox, oy, oz, 1f,
             )
             tcm.setTransform(tcm.getInstance(occ.root), om)
+        }
+
+        // --- Ombre de contact -----------------------------------------------
+        // Le maillage est en unités de DEMI-HAUTEUR DE BIJOU (y = ±1 tombe sur
+        // ses bords), donc une simple mise à l'échelle par s×bandHalfHeight
+        // place le dégradé correctement sur n'importe quelle pièce.
+        //
+        // Le rayon doit tomber entre l'occluseur de profondeur et la surface
+        // intérieure du bijou : au ras de l'occluseur, la jupe serait
+        // entièrement masquée au lieu de sa seule moitié arrière ; au-delà du
+        // trou, elle traverserait le bijou.
+        //
+        // Le collier est écarté : sa géométrie est un plastron, ses « bords »
+        // le long de l'axe ne correspondent pas à un contact avec le cou.
+        val shadow = shadowAsset
+        if (shadow != null) {
+            val si = tcm.getInstance(shadow.root)
+            val limbR = when (anchor) {
+                "wrist" -> s * holeRadiusLateral / kBraceletClearance
+                "neck" -> -1f
+                else -> s * holeRadiusLateral / kRingClearance
+            }
+            if (limbR <= 0f) {
+                tcm.setTransform(si, kHiddenTransform)
+            } else {
+                val sr1 = limbR * kShadowRadiusMargin
+                val sr2 = sr1 * if (anchor == "wrist") kWristDepthRatio else 1f
+                val sLen = s * bandHalfHeight
+                val sm = floatArrayOf(
+                    colX[0] * sr1, colX[1] * sr1, colX[2] * sr1, 0f,
+                    limbAxis[0] * sLen, limbAxis[1] * sLen,
+                    limbAxis[2] * sLen, 0f,
+                    limbRadial[0] * sr2, limbRadial[1] * sr2,
+                    limbRadial[2] * sr2, 0f,
+                    // Comme l'occluseur : centré sur le MEMBRE (wx, wy, 0),
+                    // pas sur l'origine du GLB.
+                    wx, wy, 0f, 1f,
+                )
+                tcm.setTransform(si, sm)
+            }
         }
     }
 
@@ -708,9 +1028,12 @@ class NativeArView(
         // Le collier ne dépend que de la pose (épaules + tête) : pas de main
         // dans le cadrage, et un 2e détecteur coûterait du CPU pour rien.
         if (anchor == "neck") return
-        try {
+        // Même traitement que la pose : le GPU libère du temps CPU, et les
+        // deux détecteurs se partagent la même cadence de frames d'analyse.
+        fun build(delegate: Delegate): HandLandmarker {
             val baseOptions = BaseOptions.builder()
                 .setModelAssetPath(MODEL_ASSET)
+                .setDelegate(delegate)
                 .build()
             val options = HandLandmarker.HandLandmarkerOptions.builder()
                 .setBaseOptions(baseOptions)
@@ -720,10 +1043,18 @@ class NativeArView(
                 .setResultListener { result, _ -> onHands(result) }
                 .setErrorListener { e -> Log.e(TAG, "MediaPipe error: ${e.message}") }
                 .build()
-            handLandmarker = HandLandmarker.createFromOptions(activity, options)
-            Log.i(TAG, "HandLandmarker prêt")
+            return HandLandmarker.createFromOptions(activity, options)
+        }
+        handLandmarker = try {
+            build(Delegate.GPU).also { Log.i(TAG, "HandLandmarker prêt (GPU)") }
         } catch (e: Exception) {
-            Log.e(TAG, "échec init HandLandmarker", e)
+            Log.w(TAG, "délégué GPU refusé pour la main, repli CPU", e)
+            try {
+                build(Delegate.CPU).also { Log.i(TAG, "HandLandmarker prêt (CPU)") }
+            } catch (e2: Exception) {
+                Log.e(TAG, "échec init HandLandmarker", e2)
+                null
+            }
         }
     }
 
@@ -747,9 +1078,18 @@ class NativeArView(
         // détecteur PRINCIPAL (aucune main dans le cadrage). La bague suit le
         // doigt et n'a pas besoin de la pose.
         if (anchor != "wrist" && anchor != "neck") return
-        try {
+        // La pose AVEC masque de segmentation est de loin l'étage le plus cher
+        // du pipeline. MESURÉ SUR DEVICE (logcat) : en CPU elle tournait à
+        // MOINS DE 1 Hz au lieu des ~15 Hz visés — MediaPipe en LIVE_STREAM
+        // jette les frames tant que le graphe est occupé. Le suivi se
+        // retrouvait alors privé de l'axe d'avant-bras ET de la mesure de
+        // silhouette la quasi-totalité du temps (logs : "pose absente" et
+        // "estimé main" quasi partout), donc la manchette suivait la PAUME.
+        // On demande le GPU, avec repli CPU si le device le refuse.
+        fun build(delegate: Delegate): PoseLandmarker {
             val baseOptions = BaseOptions.builder()
                 .setModelAssetPath(POSE_MODEL_ASSET)
+                .setDelegate(delegate)
                 .build()
             val options = PoseLandmarker.PoseLandmarkerOptions.builder()
                 .setBaseOptions(baseOptions)
@@ -762,10 +1102,18 @@ class NativeArView(
                 .setResultListener { result, _ -> onPose(result) }
                 .setErrorListener { e -> Log.e(TAG, "Pose error: ${e.message}") }
                 .build()
-            poseLandmarker = PoseLandmarker.createFromOptions(activity, options)
-            Log.i(TAG, "PoseLandmarker prêt")
+            return PoseLandmarker.createFromOptions(activity, options)
+        }
+        poseLandmarker = try {
+            build(Delegate.GPU).also { Log.i(TAG, "PoseLandmarker prêt (GPU)") }
         } catch (e: Exception) {
-            Log.e(TAG, "échec init PoseLandmarker", e)
+            Log.w(TAG, "délégué GPU refusé pour la pose, repli CPU", e)
+            try {
+                build(Delegate.CPU).also { Log.i(TAG, "PoseLandmarker prêt (CPU)") }
+            } catch (e2: Exception) {
+                Log.e(TAG, "échec init PoseLandmarker", e2)
+                null
+            }
         }
     }
 
@@ -842,10 +1190,15 @@ class NativeArView(
             )
         }
 
+        // Écran → monde : x mis à l'échelle par l'aspect (cf. viewAspect), y
+        // inversé. Sans ce facteur l'axe rendu n'était PAS celui de
+        // l'avant-bras visible — la manchette se posait de travers sur le
+        // bras, ce qui est exactement l'effet "cylindre placé devant le bras".
+        val aspect = viewAspect()
         fun candidate(applyRot: Boolean): FloatArray {
             val pw = toScr(lm[wristIdx].x(), lm[wristIdx].y(), applyRot)
             val pe = toScr(lm[elbowIdx].x(), lm[elbowIdx].y(), applyRot)
-            return floatArrayOf(pw[0] - pe[0], -(pw[1] - pe[1]), 0f)
+            return floatArrayOf((pw[0] - pe[0]) * aspect, -(pw[1] - pe[1]), 0f)
         }
 
         val ref = normalized(axisVec, fallback = floatArrayOf(0f, 1f, 0f))
@@ -883,83 +1236,30 @@ class NativeArView(
         // commerciaux), plus sur un ratio anatomique estimé.
         val masksOpt = result.segmentationMasks()
         if (masksOpt.isPresent && masksOpt.get().isNotEmpty()) {
-            val mask = masksOpt.get()[0]
-            val bb = ByteBufferExtractor.extract(mask)
-            bb.order(ByteOrder.nativeOrder())
-            val fb = bb.asFloatBuffer()
-            val mw = mask.width
-            val mh = mask.height
-
-            // L'espace du masque peut suivre les landmarks (déjà redressés
-            // sur ce device) OU rester capteur brut — même famille de pièges
-            // que les rotations de landmarks. On sonde le poignet dans les
-            // deux conventions et on garde celle où il tombe dans la personne.
-            fun toRawSpace(x: Float, y: Float): FloatArray = when (rot) {
-                90 -> floatArrayOf(y, 1f - x)
-                180 -> floatArrayOf(1f - x, 1f - y)
-                270 -> floatArrayOf(1f - y, x)
-                else -> floatArrayOf(x, y)
-            }
-            fun sample(x: Float, y: Float, raw: Boolean): Float {
-                val p = if (raw) toRawSpace(x, y) else floatArrayOf(x, y)
-                val xi = (p[0] * mw).toInt()
-                val yi = (p[1] * mh).toInt()
-                if (xi < 0 || xi >= mw || yi < 0 || yi >= mh) return 0f
-                return fb.get(yi * mw + xi)
-            }
-
+            val scanner = MaskScanner(masksOpt.get()[0], rot, kSegMaxWidthFrac)
             val wl = lm[wristIdx]
             val el = lm[elbowIdx]
             // La convention d'espace du masque est sondée au point PROCHE
             // (toujours sur le bras si la détection est bonne).
-            val nx = wl.x() + (el.x() - wl.x()) * kScanNear
-            val ny = wl.y() + (el.y() - wl.y()) * kScanNear
-            val rawMode: Boolean? = when {
-                sample(nx, ny, false) >= 0.5f -> false
-                sample(nx, ny, true) >= 0.5f -> true
-                else -> null
-            }
-
-            // Direction avant-bras en pixels masque (anisotropie corrigée),
-            // pas de balayage = 1 pixel.
-            val fxp = (wl.x() - el.x()) * mw
-            val fyp = (wl.y() - el.y()) * mh
-            val fl = hypot(fxp, fyp)
+            val rawMode = scanner.probeRawMode(
+                wl.x() + (el.x() - wl.x()) * kScanNear,
+                wl.y() + (el.y() - wl.y()) * kScanNear,
+            )
 
             /** Pleine largeur de la silhouette à [frac] le long de
              *  poignet→coude, en espace écran : [midX, midY, dX, dY].
-             *  null = bord non trouvé (balayage parti dans le torse ou
-             *  l'autre bras) ou largeur invraisemblable. */
+             *  null = bord non trouvé ou largeur invraisemblable. */
             fun measureAt(frac: Float): FloatArray? {
-                if (rawMode == null || fl <= 1e-3f) return null
-                val cxN = wl.x() + (el.x() - wl.x()) * frac
-                val cyN = wl.y() + (el.y() - wl.y()) * frac
-                val stepX = -(fyp / fl) / mw
-                val stepY = (fxp / fl) / mh
-                val maxSteps = (kSegMaxWidthFrac * maxOf(mw, mh)).toInt()
-                fun march(sign: Int): Int {
-                    var miss = 0
-                    var i = 1
-                    while (i <= maxSteps) {
-                        val v = sample(
-                            cxN + sign * i * stepX,
-                            cyN + sign * i * stepY,
-                            rawMode,
-                        )
-                        if (v < 0.5f) {
-                            if (++miss >= 3) return i - miss
-                        } else {
-                            miss = 0
-                        }
-                        i++
-                    }
-                    return maxSteps
-                }
-                val dPlus = march(1)
-                val dMinus = march(-1)
-                if (dPlus >= maxSteps || dMinus >= maxSteps) return null
-                val e1 = toScr(cxN + dPlus * stepX, cyN + dPlus * stepY, useRot)
-                val e2 = toScr(cxN - dMinus * stepX, cyN - dMinus * stepY, useRot)
+                if (rawMode == null) return null
+                val e = scanner.measureEdges(
+                    wl.x() + (el.x() - wl.x()) * frac,
+                    wl.y() + (el.y() - wl.y()) * frac,
+                    wl.x() - el.x(),
+                    wl.y() - el.y(),
+                    rawMode,
+                ) ?: return null
+                val e1 = toScr(e[0], e[1], useRot)
+                val e2 = toScr(e[2], e[3], useRot)
                 val v = floatArrayOf(
                     (e1[0] + e2[0]) * 0.5f,
                     (e1[1] + e2[1]) * 0.5f,
@@ -986,7 +1286,7 @@ class NativeArView(
                     "seg: mode=${rawMode ?: "hors masque"} " +
                         "largeurProche=$nw largeurLoin=$fw " +
                         "centre=(${near?.get(0)}, ${near?.get(1)}) " +
-                        "masque=${mw}x$mh",
+                        "masque=${scanner.size}",
                 )
             }
         }
@@ -1068,7 +1368,12 @@ class NativeArView(
         // calcule les deux conventions et on garde celle dont l'axe du cou
         // pointe le plus "vers le haut" de l'écran — un cou filmé de face
         // monte toujours, ce qui rend le test fiable sans référence externe.
-        fun neckUp(applyRot: Boolean): FloatArray {
+        // Écart ÉCRAN (normalisé, donc anisotrope ; y vers le BAS) du milieu
+        // des épaules vers le milieu des oreilles. Gardé sous cette forme
+        // parce qu'il sert aux DEUX usages, qui ne vivent pas dans le même
+        // espace : un décalage d'ancre en unités écran, et l'axe du cou en
+        // direction monde.
+        fun neckUpScr(applyRot: Boolean): FloatArray {
             val sl = toScr(lm[11].x(), lm[11].y(), applyRot)
             val sr = toScr(lm[12].x(), lm[12].y(), applyRot)
             val el = toScr(lm[7].x(), lm[7].y(), applyRot)
@@ -1077,18 +1382,85 @@ class NativeArView(
             val sy = (sl[1] + sr[1]) * 0.5f
             val hx = (el[0] + er[0]) * 0.5f
             val hy = (el[1] + er[1]) * 0.5f
-            return floatArrayOf(hx - sx, -(hy - sy), 0f)
+            return floatArrayOf(hx - sx, hy - sy)
         }
 
-        val upRot = neckUp(true)
-        val upStraight = neckUp(false)
+        // Écran → monde (cf. viewAspect). Le collier est le plus touché des
+        // trois bijoux : l'axe du cou ET la ligne d'épaules sortent tous deux
+        // de toScr, donc colY et colX étaient faussés SIMULTANÉMENT.
+        val aspect = viewAspect()
+        fun toWorldDir(d: FloatArray): FloatArray =
+            floatArrayOf(d[0] * aspect, -d[1], 0f)
+
+        val upScrRot = neckUpScr(true)
+        val upScrStraight = neckUpScr(false)
+        val upRot = toWorldDir(upScrRot)
+        val upStraight = toWorldDir(upScrStraight)
         val useRot = normalized(upRot, floatArrayOf(0f, 0f, 0f))[1] >=
             normalized(upStraight, floatArrayOf(0f, 0f, 0f))[1]
+        val upScr = if (useRot) upScrRot else upScrStraight
 
         val shL = toScr(lm[11].x(), lm[11].y(), useRot)
         val shR = toScr(lm[12].x(), lm[12].y(), useRot)
         val shMidX = (shL[0] + shR[0]) * 0.5f
         val shMidY = (shL[1] + shR[1]) * 0.5f
+
+        // --- Largeur RÉELLE du cou via le masque de segmentation ------------
+        // On balaye la silhouette entre le milieu des épaules et le milieu des
+        // oreilles, et on garde la largeur MINIMALE : le cou est par
+        // construction l'endroit le plus étroit de ce trajet (les épaules en
+        // bas, la tête en haut sont tous deux plus larges). Ce critère évite
+        // d'avoir à régler une hauteur de balayage, qui aurait été un
+        // paramètre de plus à deviner.
+        val masksOpt = result.segmentationMasks()
+        if (masksOpt.isPresent && masksOpt.get().isNotEmpty()) {
+            val scanner = MaskScanner(masksOpt.get()[0], rot, kSegMaxWidthFrac)
+            val sx = (lm[11].x() + lm[12].x()) * 0.5f
+            val sy = (lm[11].y() + lm[12].y()) * 0.5f
+            val ex = (lm[7].x() + lm[8].x()) * 0.5f
+            val ey = (lm[7].y() + lm[8].y()) * 0.5f
+            val dx = ex - sx
+            val dy = ey - sy
+            val rawMode =
+                scanner.probeRawMode(sx + dx * kNeckScanFrom, sy + dy * kNeckScanFrom)
+            var best: FloatArray? = null
+            var bestW = Float.MAX_VALUE
+            if (rawMode != null) {
+                var f = kNeckScanFrom
+                while (f <= kNeckScanTo) {
+                    val e =
+                        scanner.measureEdges(sx + dx * f, sy + dy * f, dx, dy, rawMode)
+                    if (e != null) {
+                        val e1 = toScr(e[0], e[1], useRot)
+                        val e2 = toScr(e[2], e[3], useRot)
+                        val v = floatArrayOf(
+                            (e1[0] + e2[0]) * 0.5f,
+                            (e1[1] + e2[1]) * 0.5f,
+                            e1[0] - e2[0],
+                            e1[1] - e2[1],
+                        )
+                        val w = hypot(v[2], v[3])
+                        if (w in kSegMinWidthN..kSegMaxWidthN && w < bestW) {
+                            bestW = w
+                            best = v
+                        }
+                    }
+                    f += kNeckScanStep
+                }
+            }
+            if (best != null) {
+                neckSeg = best
+                neckSegMs = now
+            }
+            if (poseLogCount % 15 == 0) {
+                Log.i(
+                    TAG,
+                    "segCou: mode=${rawMode ?: "hors masque"} " +
+                        "largeur=${if (best != null) bestW else -1f} " +
+                        "masque=${scanner.size}",
+                )
+            }
+        }
 
         var up = normalized(
             if (useRot) upRot else upStraight,
@@ -1119,7 +1491,7 @@ class NativeArView(
         // orientée pour que colZ = colX × colY sorte vers la caméra (le motif
         // décoré du plastron est en +Z, cf. mesure du GLB : 356 k sommets
         // avant contre 78 k arrière).
-        val shVec = floatArrayOf(shR[0] - shL[0], -(shR[1] - shL[1]), 0f)
+        val shVec = toWorldDir(floatArrayOf(shR[0] - shL[0], shR[1] - shL[1]))
         val dsh = shVec[0] * up[0] + shVec[1] * up[1] + shVec[2] * up[2]
         var side = normalized(
             floatArrayOf(
@@ -1134,9 +1506,24 @@ class NativeArView(
         }
 
         // Ancre : creux sternal, légèrement au-dessus du milieu des épaules.
+        //
+        // Le décalage vaut une fraction de la largeur d'épaules MESURÉE À
+        // L'ÉCRAN : il vit donc en unités écran et doit suivre la direction
+        // ÉCRAN du cou (upScr, y vers le bas), pas la direction monde — qui
+        // n'est plus la même depuis la correction d'aspect.
+        //
+        // Les signes étaient de surcroît INVERSÉS sur les deux axes : monter
+        // vers la tête, c'est ajouter upScr, et le code le soustrayait. Le
+        // collier descendait donc de kNeckRise au lieu de monter, soit deux
+        // fois l'écart voulu dans le mauvais sens. kNeckRise ayant pu être
+        // réglé à l'œil sur ce comportement inversé, sa valeur est à revoir
+        // visuellement maintenant qu'elle agit dans le sens annoncé.
         val shoulderW = hypot(shR[0] - shL[0], shR[1] - shL[1])
-        val ax = (shMidX - up[0] * kNeckRise * shoulderW).coerceIn(0f, 1f)
-        val ay = (shMidY + up[1] * kNeckRise * shoulderW).coerceIn(0f, 1f)
+        val upScrLen = hypot(upScr[0], upScr[1])
+        val riseX = if (upScrLen > 1e-4f) upScr[0] / upScrLen else 0f
+        val riseY = if (upScrLen > 1e-4f) upScr[1] / upScrLen else -1f
+        val ax = (shMidX + riseX * kNeckRise * shoulderW).coerceIn(0f, 1f)
+        val ay = (shMidY + riseY * kNeckRise * shoulderW).coerceIn(0f, 1f)
 
         val px = fX.filter(ax, now)
         val py = fY.filter(ay, now)
@@ -1244,11 +1631,15 @@ class NativeArView(
             rx = p0[0]
             ry = p0[1]
         } else {
-            // Bague : base de l'annulaire = milieu des landmarks 13 et 14.
+            // Bague : lm13 = articulation MCP (base du doigt), lm14 = PIP
+            // (première phalange). Une bague se porte JUSTE AU-DESSUS du MCP,
+            // pas au milieu de la phalange — or le milieu de 13 et 14 tombait
+            // à mi-phalange. L'écart passait inaperçu tant que la bague était
+            // trop petite ; il ne le sera plus.
             val p13 = toScreen(lm[13])
             val p14 = toScreen(lm[14])
-            rx = (p13[0] + p14[0]) / 2f
-            ry = (p13[1] + p14[1]) / 2f
+            rx = p13[0] + (p14[0] - p13[0]) * kRingAlongPhalanx
+            ry = p13[1] + (p14[1] - p13[1]) * kRingAlongPhalanx
         }
 
         val px = fX.filter(rx.coerceIn(0f, 1f), now)
@@ -1281,6 +1672,11 @@ class NativeArView(
                 // l'axe pose diverge trop de l'axe main (>~60°), c'est une
                 // détection/convention douteuse → repli sur l'axe main (qui a
                 // fait ses preuves). Idem si la pose n'est pas fraîche.
+                // Le produit scalaire ci-dessous n'a de sens que depuis la
+                // correction d'aspect : l'axe pose vient de coordonnées écran
+                // et l'axe main des world landmarks métriques — deux repères
+                // différents tant que le facteur halfW/halfH manquait, donc un
+                // seuil qui ne mesurait pas l'angle qu'il croyait mesurer.
                 val handAxis = worldDelta(w[9], w[0])
                 val pa = poseAxis
                 if (pa != null && now - poseAxisMs < kPoseFreshMs) {
@@ -1321,6 +1717,32 @@ class NativeArView(
             if (flip) normN = floatArrayOf(-normN[0], -normN[1], -normN[2])
             prevNormal = normN
 
+            // --- Largeur du DOIGT, mesurée sur le squelette métrique --------
+            // L'écart entre deux articulations MCP voisines vaut sensiblement
+            // la largeur d'un doigt (les doigts sont jointifs à la base).
+            // Rapportée à la longueur de main, elle donne une proportion
+            // propre à CET utilisateur — là où kRingPerHand appliquait la même
+            // à tout le monde. Le rapport est calculé en 3D sur les world
+            // landmarks, donc insensible au raccourcissement de perspective :
+            // c'est justement ce qu'une mesure à l'écran ne saurait pas faire.
+            fun metricDist(p: Landmark, q: Landmark): Float {
+                val dx = p.x() - q.x()
+                val dy = p.y() - q.y()
+                val dz = p.z() - q.z()
+                return sqrt(dx * dx + dy * dy + dz * dz)
+            }
+            val handLen3 = metricDist(w[9], w[0])
+            if (handLen3 > 1e-5f) {
+                val pitch =
+                    0.5f * (metricDist(w[13], w[9]) + metricDist(w[17], w[13]))
+                val raw = pitch / handLen3
+                // Hors de cette fourchette, la détection est aberrante (main
+                // repliée, doigts fusionnés) : on garde la valeur précédente.
+                if (raw in kFingerPitchMin..kFingerPitchMax) {
+                    fingerPitchRatio = fPitch.filter(raw, now)
+                }
+            }
+
             // Normalisation avant filtrage : composantes d'amplitude stable,
             // indépendantes de la taille de main.
             val axisN = normalized(axisRaw, fallback = axisVec)
@@ -1360,11 +1782,33 @@ class NativeArView(
         fHandDY.reset()
         fAxis.forEach { it.reset() }
         fNorm.forEach { it.reset() }
+        // Le filtre repart de zéro, mais PAS fingerPitchRatio : c'est une
+        // constante morphologique, la bague ne doit pas changer de taille
+        // parce que la main est sortie du champ une seconde.
+        fPitch.reset()
         // Le signe de la normale se réinitialisera "face caméra".
         prevNormal = null
     }
 
     // --- petites aides vectorielles ----------------------------------------
+
+    /** Rapport largeur/hauteur de la vue = halfW/halfH.
+     *
+     *  Les coordonnées écran normalisées sont normalisées SÉPARÉMENT sur
+     *  chaque axe ([0..1] en largeur, [0..1] en hauteur) : elles sont donc
+     *  anisotropes, et un même écart en x et en y ne représente pas la même
+     *  distance monde. Les POSITIONS et les LARGEURS mesurées appliquent déjà
+     *  la conversion (`× 2·halfW` / `× 2·halfH`) ; les AXES l'omettaient, ce
+     *  qui faussait l'orientation d'autant que l'écran est allongé — jusqu'à
+     *  ~20° en diagonale sur un 20:9, nul quand le membre est vertical ou
+     *  horizontal (d'où un défaut qui échappe aux essais les plus naturels).
+     *  Comme les axes sont normalisés ensuite, seul le RAPPORT compte : un
+     *  seul facteur sur x suffit. */
+    private fun viewAspect(): Float {
+        val w = root.width
+        val h = root.height
+        return if (w > 0 && h > 0) w.toFloat() / h.toFloat() else 1f
+    }
 
     private fun cross(a: FloatArray, b: FloatArray): FloatArray = floatArrayOf(
         a[1] * b[2] - a[2] * b[1],
@@ -1392,10 +1836,25 @@ class NativeArView(
             try {
                 val provider = providerFuture.get()
                 cameraProvider = provider
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
+                // MÊME rapport d'aspect imposé aux DEUX flux. Sans cette
+                // contrainte, CameraX est libre de servir du 4:3 à l'analyse et
+                // du 16:9 à la preview : les landmarks seraient alors mesurés
+                // dans une géométrie et affichés dans une autre. Or le
+                // recadrage cx/cy (cf. toScreen) est calculé sur la frame
+                // d'ANALYSE et appliqué à ce qu'affiche la PREVIEW — l'erreur
+                // serait nulle au centre de l'écran et croissante vers les
+                // bords, un décalage très pénible à diagnostiquer à l'œil.
+                val resolution = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(
+                        AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY,
+                    )
+                    .build()
+                val preview = Preview.Builder()
+                    .setResolutionSelector(resolution)
+                    .build()
+                    .also { it.setSurfaceProvider(previewView.surfaceProvider) }
                 val analysis = ImageAnalysis.Builder()
+                    .setResolutionSelector(resolution)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
@@ -1408,7 +1867,24 @@ class NativeArView(
                     analysis,
                 )
                 readCameraFov(camera.cameraInfo)
-                Log.i(TAG, "Caméra liée (preview + analyse)")
+                // Les deux résolutions DOIVENT avoir le même rapport d'aspect :
+                // c'est l'hypothèse sur laquelle repose toute la conversion
+                // landmark → écran. Journalisé pour pouvoir le vérifier au
+                // lieu de l'espérer.
+                val pr = preview.resolutionInfo?.resolution
+                val ar = analysis.resolutionInfo?.resolution
+                val pa = pr?.let { it.width.toFloat() / it.height }
+                val aa = ar?.let { it.width.toFloat() / it.height }
+                Log.i(
+                    TAG,
+                    "Caméra liée — preview=$pr (aspect=$pa) " +
+                        "analyse=$ar (aspect=$aa) " +
+                        if (pa != null && aa != null && abs(pa - aa) > 0.02f) {
+                            "*** ASPECTS DIFFÉRENTS : le mapping écran sera faux ***"
+                        } else {
+                            "aspects cohérents"
+                        },
+                )
             } catch (e: Exception) {
                 Log.e(TAG, "camera bind failed", e)
             }
@@ -1482,58 +1958,153 @@ class NativeArView(
 
     // --- chargement assets -------------------------------------------------
 
+    /** Lit `<nom>.fit.json`, posé à côté du GLB par tool/fit_analyzer.dart.
+     *  Absent = repli sur les constantes intégrées, pas une erreur : un asset
+     *  non encore analysé doit continuer de s'afficher. */
+    private fun loadFit(): JewelFit? {
+        if (assetPath.isEmpty()) return null
+        val path = "flutter_assets/" +
+            assetPath.removeSuffix(".glb") + ".fit.json"
+        return try {
+            val txt = activity.assets.open(path)
+                .use { it.readBytes() }
+                .toString(Charsets.UTF_8)
+            JewelFit(JSONObject(txt)).also {
+                Log.i(
+                    TAG,
+                    "fit chargé: axe=${it.holeAxis} " +
+                        "trou=${it.holeRadiusMin}..${it.holeRadiusMax} " +
+                        "latéral=${it.radiusToward("X")} " +
+                        "centre=(${it.holeCenter[0]}, ${it.holeCenter[1]}, " +
+                        "${it.holeCenter[2]}) " +
+                        "demiHauteur=${it.axisHalfExtent} " +
+                        "ouverture=${it.openingAt}@${it.openingRadius}",
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "pas de $path — repli sur les constantes intégrées", e)
+            null
+        }
+    }
+
     private fun loadModel() {
         try {
             val bytes = activity.assets
                 .open("flutter_assets/$assetPath")
                 .use { it.readBytes() }
             modelViewer.loadModelGlb(bytes.toDirectByteBuffer())
-            Log.i(TAG, "modèle chargé: $assetPath (${bytes.size} o)")
+            // Priorité EXPLICITE : le bijou doit passer APRÈS l'occluseur, qui
+            // lui écrit la profondeur. Laisser la valeur par défaut ne suffit
+            // pas — c'est justement l'égalité de priorité, combinée à un
+            // centroïde identique, qui rendait l'ordre indéterminé.
+            val rm = modelViewer.engine.renderableManager
+            var n = 0
+            modelViewer.asset?.entities?.forEach { e ->
+                val ri = rm.getInstance(e)
+                if (ri != 0) {
+                    rm.setPriority(ri, kPriorityJewel)
+                    n++
+                }
+            }
+            Log.i(
+                TAG,
+                "modèle chargé: $assetPath (${bytes.size} o, " +
+                    "$n renderables, priorité=$kPriorityJewel)",
+            )
         } catch (e: Exception) {
             Log.e(TAG, "échec chargement modèle: $assetPath", e)
         }
     }
 
-    /** Charge le cylindre occluseur (assets/occluders/cylinder.glb : rayon 1,
-     *  hauteur 1 le long de Y) via un AssetLoader dédié, puis bascule ses
-     *  matériaux en écriture de profondeur SEULE. */
-    private fun loadOccluder() {
-        try {
-            val bytes = activity.assets
-                .open("flutter_assets/assets/occluders/cylinder.glb")
-                .use { it.readBytes() }
-            val engine = modelViewer.engine
-            val provider = UbershaderProvider(engine)
-            val loader = AssetLoader(engine, provider, EntityManager.get())
-            val asset = loader.createAsset(bytes.toDirectByteBuffer())
-                ?: throw IllegalStateException("createAsset a renvoyé null")
-            val resourceLoader = ResourceLoader(engine)
-            resourceLoader.loadResources(asset)
-            asset.releaseSourceData()
-            val rm = engine.renderableManager
-            for (entity in asset.entities) {
-                val ri = rm.getInstance(entity)
-                if (ri == 0) continue
-                for (p in 0 until rm.getPrimitiveCount(ri)) {
-                    rm.getMaterialInstanceAt(ri, p).apply {
-                        // En mode debug, le cylindre reste visible (rouge).
-                        if (!debugOccluder) setColorWrite(false)
-                        setDepthWrite(true)
-                    }
-                }
+    /** Charge un GLB auxiliaire (occluseur, ombre) via un AssetLoader dédié et
+     *  laisse l'appelant configurer ses matériaux. Les loaders sont conservés
+     *  vivants : Filament panique si on détruit un matériau dont des instances
+     *  survivent (cf. dispose). */
+    private fun loadAuxAsset(
+        subPath: String,
+        label: String,
+        priority: Int,
+        configure: (MaterialInstance) -> Unit,
+    ): FilamentAsset? = try {
+        val bytes = activity.assets
+            .open("flutter_assets/$subPath")
+            .use { it.readBytes() }
+        val engine = modelViewer.engine
+        val provider = UbershaderProvider(engine)
+        val loader = AssetLoader(engine, provider, EntityManager.get())
+        val asset = loader.createAsset(bytes.toDirectByteBuffer())
+            ?: throw IllegalStateException("createAsset a renvoyé null")
+        val resourceLoader = ResourceLoader(engine)
+        resourceLoader.loadResources(asset)
+        asset.releaseSourceData()
+        val rm = engine.renderableManager
+        var renderables = 0
+        var primitives = 0
+        for (entity in asset.entities) {
+            val ri = rm.getInstance(entity)
+            if (ri == 0) continue
+            renderables++
+            // ORDRE DE DESSIN. Filament trie la passe opaque d'avant en
+            // arrière PAR CENTROÏDE. L'occluseur et le bijou partagent
+            // exactement le même centre : l'ordre était donc indéterminé. Or un
+            // occulteur de profondeur DOIT passer avant ce qu'il masque —
+            // sinon le bijou écrit d'abord sa couleur, l'occulteur écrit
+            // ensuite la profondeur sans la couleur (colorWrite=false), et le
+            // dos du bijou reste affiché. C'est très exactement le symptôme
+            // observé : anneau visible à 360° et ombre de contact en anneau
+            // COMPLET au lieu d'un demi-anneau.
+            rm.setPriority(ri, priority)
+            for (p in 0 until rm.getPrimitiveCount(ri)) {
+                configure(rm.getMaterialInstanceAt(ri, p))
+                primitives++
             }
-            modelViewer.scene.addEntities(asset.entities)
-            occProvider = provider
-            occLoader = loader
-            occResourceLoader = resourceLoader
-            occAsset = asset
-            Log.i(
-                TAG,
-                "occluseur chargé (${asset.entities.size} entités, " +
-                    "debug=$debugOccluder)",
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "échec chargement occluseur", e)
+        }
+        modelViewer.scene.addEntities(asset.entities)
+        auxProviders += provider
+        auxLoaders += loader
+        auxResourceLoaders += resourceLoader
+        Log.i(
+            TAG,
+            "$label chargé : ${asset.entities.size} entités, " +
+                "$renderables renderables, $primitives primitives, " +
+                "priorité=$priority" +
+                if (renderables == 0) " *** AUCUN RENDERABLE, NE RENDRA PAS ***" else "",
+        )
+        asset
+    } catch (e: Exception) {
+        Log.e(TAG, "échec chargement $label", e)
+        null
+    }
+
+    /** Cylindre occluseur (rayon 1, hauteur 1 le long de Y), basculé en
+     *  écriture de PROFONDEUR SEULE : invisible, mais tout fragment situé
+     *  derrière lui est masqué. */
+    private fun loadOccluder() {
+        occAsset = loadAuxAsset(
+            "assets/occluders/cylinder.glb",
+            "occluseur (debug=$debugOccluder)",
+            kPriorityOccluder,
+        ) { mi ->
+            // En mode debug, le cylindre reste visible (rouge).
+            if (!debugOccluder) mi.setColorWrite(false)
+            mi.setDepthWrite(true)
+        }
+    }
+
+    /** Jupe d'ombre de contact (cf. tool/gen_contact_shadow.dart) : noire, en
+     *  alpha dégradé, posée juste au-dessus de la peau au-delà des bords du
+     *  bijou. C'est le cylindre occluseur qui en élimine la moitié arrière ;
+     *  ne subsiste que celle tournée vers la caméra, ce qui se lit comme un
+     *  assombrissement de la peau visible. */
+    private fun loadContactShadow() {
+        shadowAsset = loadAuxAsset(
+            "assets/occluders/contact_shadow.glb",
+            "ombre de contact",
+            kPriorityShadow,
+        ) { mi ->
+            // Surtout PAS d'écriture de profondeur : la jupe est transparente,
+            // si elle écrivait la profondeur elle masquerait le bijou.
+            mi.setDepthWrite(false)
         }
     }
 
@@ -1545,10 +2116,38 @@ class NativeArView(
             val ibl = KTX1Loader
                 .createIndirectLight(modelViewer.engine, bytes.toDirectByteBuffer())
                 .indirectLight
-            ibl?.intensity = 30_000f
+            ibl?.intensity = kIblLux
             modelViewer.scene.indirectLight = ibl
         } catch (e: Exception) {
             Log.e(TAG, "échec chargement IBL", e)
+        }
+
+        // --- Lumière directionnelle -----------------------------------------
+        // La scène n'en contenait AUCUNE : uniquement l'IBL, c'est-à-dire un
+        // éclairage parfaitement uniforme. Un métal éclairé uniformément n'a
+        // pas de reflet franc — il rend comme une texture plate, ce qui est
+        // l'un des plus gros contributeurs à l'effet "autocollant" (le cerveau
+        // lit l'incohérence des spéculaires avant de savoir la nommer).
+        //
+        // La direction réelle de la lumière de la pièce est inconnue. On prend
+        // le cas de très loin le plus fréquent en selfie : source au-dessus et
+        // légèrement derrière l'appareil (plafonnier, fenêtre). C'est faux
+        // parfois, mais uniformément faux est PIRE que approximativement juste :
+        // sans direction, le bijou ne réagit à aucun mouvement.
+        try {
+            val engine = modelViewer.engine
+            val sun = EntityManager.get().create()
+            LightManager.Builder(LightManager.Type.DIRECTIONAL)
+                .color(1.0f, 0.97f, 0.92f) // légèrement chaud, comme un intérieur
+                .intensity(kSunLux)
+                .direction(kSunDir[0], kSunDir[1], kSunDir[2])
+                .castShadows(true) // le chaton d'une bague se projette sur l'anneau
+                .build(engine, sun)
+            modelViewer.scene.addEntity(sun)
+            sunLight = sun
+            Log.i(TAG, "lumière directionnelle ajoutée (${kSunLux.toInt()} lx)")
+        } catch (e: Exception) {
+            Log.e(TAG, "échec création lumière directionnelle", e)
         }
     }
 
@@ -1566,14 +2165,15 @@ class NativeArView(
         handLandmarker = null
         poseLandmarker?.close()
         poseLandmarker = null
-        // NE PAS détruire les objets gltfio de l'occluseur : Filament panique
+        // NE PAS détruire les objets gltfio auxiliaires : Filament panique
         // (SIGABRT « destroying material ... instances still alive ») car le
         // moteur du ModelViewer vit encore. Fuite assumée, comme pour le
         // ModelViewer lui-même (l'écran suivant recrée tout).
         occAsset = null
-        occResourceLoader = null
-        occLoader = null
-        occProvider = null
+        shadowAsset = null
+        auxResourceLoaders.clear()
+        auxLoaders.clear()
+        auxProviders.clear()
     }
 
     private fun ByteArray.toDirectByteBuffer(): ByteBuffer =
@@ -1605,6 +2205,17 @@ class NativeArView(
         // --- Calibration (à ajuster visuellement) ---
         /** Distance caméra→modèle (cohérente avec orbitHomePosition). */
         private const val kCameraDistance = 4.0f
+
+        /** Éclairage. L'IBL porte l'ambiante, la directionnelle porte le
+         *  reflet — c'est elle qui fait qu'un métal réagit quand on bouge.
+         *  Intensités du même ordre : la directionnelle doit sculpter le
+         *  bijou, pas le brûler. */
+        private const val kIblLux = 30_000f
+        private const val kSunLux = 25_000f
+
+        /** Direction de la lumière (monde : X droite, Y haut, Z vers la
+         *  caméra). Au-dessus et légèrement en avant du sujet. */
+        private val kSunDir = floatArrayOf(-0.25f, -0.85f, -0.46f)
         /** FOV vertical de repli (radians, ~60°) si Camera2 est illisible —
          *  ordre de grandeur des caméras frontales. Le FOV réel est lu au
          *  démarrage dans readCameraFov. */
@@ -1620,10 +2231,32 @@ class NativeArView(
          *  (script glb_measure) : s = ratio ÷ 2. À affiner visuellement. */
         private const val kRingPerHand = 0.12f
 
-        /** Rayon intérieur du trou du bracelet en unités modèle (mesuré par
-         *  glb_pivot_check : anneau complet 360°, trou le long de +Y,
-         *  parfaitement centré sur l'origine du GLB). */
-        private const val kModelInnerRadius = 0.652f
+        // --- REPLIS de la géométrie des bijoux -------------------------
+        // Ces valeurs ne sont plus la source de vérité : le runtime lit
+        // `<nom>.fit.json` (cf. tool/fit_analyzer.dart, JewelFit). Elles ne
+        // servent que si l'analyse n'a pas été lancée sur un asset, pour
+        // qu'il s'affiche quand même. Ne les ajustez PAS à l'œil — relancez
+        // l'analyseur, c'est tout l'intérêt du dispositif.
+
+        /** Repli : rayon du trou de la manchette dans la direction
+         *  MÉDIO-LATÉRALE (modèle X → colX). C'est bien celui-là et pas le
+         *  rayon minimal, parce que la segmentation mesure la largeur du bras
+         *  dans cette même direction et que le trou est nettement OVALE
+         *  (0.70 × 0.90, comme un vrai poignet). */
+        private const val kModelInnerRadius = 0.82f
+
+        /** Replis : centre du trou dans le repère du modèle. */
+        private const val kCuffHoleX = 0.0127f
+        private const val kCuffHoleZ = -0.0531f
+        private const val kRingHoleX = 0.0131f
+        private const val kRingHoleY = -0.3213f
+
+        /** Repli : petit axe du trou de la bague. */
+        private const val kRingHoleFallback = 0.553f
+
+        /** Retrait de l'occluseur de bague sous le petit axe du trou : au-delà
+         *  du trou, le cylindre de profondeur masquerait la bague elle-même. */
+        private const val kRingOccInset = 0.90f
 
         /** Largeur anatomique du poignet en fraction de la taille de main
          *  (distance lm0–lm9) : poignet ~5,5–6,5 cm pour ~8–9 cm de main. */
@@ -1636,6 +2269,29 @@ class NativeArView(
 
         /** Fraîcheur max de la mesure silhouette avant repli anatomique. */
         private const val kSegFreshMs = 400L
+
+        /** Balayage du cou : bornes du trajet milieu des épaules → milieu des
+         *  oreilles, et pas d'échantillonnage. On garde la largeur minimale
+         *  sur cette plage, le cou étant l'endroit le plus étroit du trajet. */
+        private const val kNeckScanFrom = 0.25f
+        private const val kNeckScanTo = 0.65f
+        private const val kNeckScanStep = 0.08f
+
+        /** Bornes de vraisemblance du rapport largeur de doigt / longueur de
+         *  main. Un doigt fait ~18-20 mm pour une main (poignet→MCP) de
+         *  ~90-100 mm, soit ~0.20 ; hors de cette plage la détection est
+         *  aberrante (main repliée, doigts fusionnés dans le masque). */
+        private const val kFingerPitchMin = 0.12f
+        private const val kFingerPitchMax = 0.35f
+
+        /** Jeu de la bague autour du doigt : une bague est ajustée, bien plus
+         *  qu'une manchette — elle doit tenir sans tomber. */
+        private const val kRingClearance = 1.06f
+
+        /** Position de la bague le long de la phalange proximale, en fraction
+         *  de MCP (lm13) → PIP (lm14). 0 = sur l'articulation, 1 = à la
+         *  jointure suivante. Une bague repose juste au-dessus du MCP. */
+        private const val kRingAlongPhalanx = 0.25f
 
         /** Points de mesure de la largeur, en fraction de l'axe
          *  poignet→coude. Deux mesures : le rayon au bord haut de la
@@ -1709,9 +2365,21 @@ class NativeArView(
          *  au-delà, le balayage a fui dans le torse/l'autre bras → rejet. */
         private const val kSegMaxWidthFrac = 0.35f
 
-        /** Bornes de validité de la largeur mesurée (écran normalisé). */
+        /** Bornes de validité de la largeur mesurée (écran normalisé). Borne
+         *  GROSSIÈRE seulement : 0.40 laisse passer un balayage parti dans le
+         *  torse. Le vrai filtre est le rapport à l'estimation anatomique
+         *  ci-dessous, qui a une référence à quoi se comparer. */
         private const val kSegMinWidthN = 0.02f
         private const val kSegMaxWidthN = 0.40f
+
+        /** Rapport accepté entre le rayon MESURÉ sur le masque et le rayon
+         *  ESTIMÉ depuis la taille de main. En dessous/au-dessus, la mesure a
+         *  fui (torse, autre bras) ou s'est effondrée sur un bord : on garde
+         *  l'estimation. Fourchette large, parce que l'estimation est elle-même
+         *  un ratio de population — on ne cherche qu'à écarter l'aberrant, pas
+         *  à contraindre la mesure (dont c'est tout l'intérêt d'être réelle). */
+        private const val kSegRadiusMinRatio = 0.60f
+        private const val kSegRadiusMaxRatio = 1.70f
 
         /** Lissage (fraction/frame) et borne de la correction latérale vers
          *  le centre mesuré de la silhouette. */
@@ -1725,6 +2393,20 @@ class NativeArView(
 
         /** Profondeur du poignet / largeur (ellipse anatomique aplatie). */
         private const val kWristDepthRatio = 0.70f
+
+        /** Rayon de la jupe d'ombre, en fraction du rayon du membre.
+         *
+         *  Contrainte BASSE seulement : il faut rester au-dessus de
+         *  l'occluseur de profondeur (kOccluderMargin = 1.05), sinon la jupe
+         *  est masquée EN ENTIER au lieu de sa seule moitié arrière et l'ombre
+         *  disparaît. Le trou du bijou (1.12) ne contraint PAS : la jupe vit
+         *  axialement en DEHORS de la pièce (|y| ≥ 1 demi-hauteur), là où il
+         *  n'y a plus de géométrie de bijou.
+         *
+         *  1.14 laisse ~6 % de marge sur l'occluseur — assez pour absorber le
+         *  bruit de mesure — tout en restant largement sous la silhouette
+         *  extérieure du bijou, donc l'ombre hugge bien le membre. */
+        private const val kShadowRadiusMargin = 1.14f
 
         /** Norme min de la composante du vecteur silhouette orthogonale à
          *  l'axe du bras (unités monde) pour en tirer un roulis : en dessous,
@@ -1741,12 +2423,19 @@ class NativeArView(
          *  divisions extrêmes quand le membre pointe vers la caméra). */
         private const val kMinPlanarFactor = 0.35f
 
-        /** Occluseur bague : rayon < rayon intérieur mesuré du trou (0.242,
-         *  le trou est en partie recouvert en projection par la fleur, on
-         *  reste en dessous), × échelle du bijou (s). Longueur : traverse
-         *  largement le bijou le long du membre (idem kWristOccLen). */
+        /** Priorités de rendu Filament (0 = dessiné en premier, 7 en dernier).
+         *
+         *  L'occulteur DOIT précéder le bijou : il n'écrit que la profondeur,
+         *  donc s'il passe après, la couleur du dos du bijou est déjà dans le
+         *  framebuffer et y reste. L'ombre passe en dernier — elle est
+         *  transparente et doit être testée contre tout le reste. */
+        private const val kPriorityOccluder = 0
+        private const val kPriorityJewel = 4
+        private const val kPriorityShadow = 7
+
+        /** Longueur des occluseurs : traversent largement le bijou le long du
+         *  membre (le rayon, lui, vient désormais du fit.json). */
         private const val kWristOccLen = 4.0f
-        private const val kRingOccRadius = 0.62f
         private const val kRingOccLen = 7.0f
 
         /** Avance temporelle (s) de la compensation de latence. */
@@ -1758,6 +2447,13 @@ class NativeArView(
         /** Silence de détection au-delà duquel les filtres repartent de zéro. */
         private const val kResetAfterMs = 500L
 
+        /** Délai de grâce : on maintient la dernière pose connue plutôt que de
+         *  faire clignoter le bijou sur un décrochage passager du détecteur.
+         *  Assez long pour couvrir quelques frames manquées, assez court pour
+         *  qu'une main réellement sortie du champ ne laisse pas un bijou
+         *  fantôme flotter à l'écran. */
+        private const val kHoldAfterLossMs = 220L
+
         /** Transform "invisible" (échelle nulle) quand aucune main n'est vue. */
         private val kHiddenTransform = floatArrayOf(
             0f, 0f, 0f, 0f,
@@ -1765,6 +2461,142 @@ class NativeArView(
             0f, 0f, 0f, 0f,
             0f, 0f, 10f, 1f,
         )
+    }
+}
+
+/**
+ * Balayage du masque de segmentation personne : mesure la PLEINE LARGEUR d'un
+ * membre perpendiculairement à son axe.
+ *
+ * Extrait de [NativeArView.onPose] pour servir aussi au COU. Mesurer une
+ * silhouette réelle est ce qui remplace un ratio anatomique de population par
+ * la morphologie de l'utilisateur — c'est la technique des essayages
+ * commerciaux, et elle vaut pour tous les membres, pas seulement l'avant-bras
+ * pour lequel elle avait été écrite.
+ *
+ * Toutes les coordonnées sont en espace LANDMARK normalisé ; la conversion
+ * vers l'écran reste à l'appelant, seul à connaître la convention de rotation
+ * qu'il a retenue.
+ */
+private class MaskScanner(
+    mask: MPImage,
+    private val rot: Int,
+    private val maxWidthFrac: Float,
+) {
+    private val mw: Int = mask.width
+    private val mh: Int = mask.height
+    private val fb: FloatBuffer = ByteBufferExtractor.extract(mask)
+        .order(ByteOrder.nativeOrder())
+        .asFloatBuffer()
+
+    private fun toRawSpace(x: Float, y: Float): FloatArray = when (rot) {
+        90 -> floatArrayOf(y, 1f - x)
+        180 -> floatArrayOf(1f - x, 1f - y)
+        270 -> floatArrayOf(1f - y, x)
+        else -> floatArrayOf(x, y)
+    }
+
+    fun sample(x: Float, y: Float, raw: Boolean): Float {
+        val p = if (raw) toRawSpace(x, y) else floatArrayOf(x, y)
+        val xi = (p[0] * mw).toInt()
+        val yi = (p[1] * mh).toInt()
+        if (xi < 0 || xi >= mw || yi < 0 || yi >= mh) return 0f
+        return fb.get(yi * mw + xi)
+    }
+
+    /** L'espace du masque suit les landmarks redressés sur certains devices et
+     *  reste en capteur brut sur d'autres — même famille de pièges que les
+     *  rotations de landmarks. On sonde un point qui DOIT tomber dans la
+     *  personne et on garde la convention qui répond. null = ni l'une ni
+     *  l'autre, donc détection douteuse. */
+    fun probeRawMode(x: Float, y: Float): Boolean? = when {
+        sample(x, y, false) >= 0.5f -> false
+        sample(x, y, true) >= 0.5f -> true
+        else -> null
+    }
+
+    /** Bords de la silhouette au point ([cx], [cy]), balayés perpendiculairement
+     *  à ([dirX], [dirY]). Renvoie [e1x, e1y, e2x, e2y] en espace landmark, ou
+     *  null si un bord n'a pas été trouvé — le balayage a fui dans le torse ou
+     *  l'autre bras, et une largeur fausse vaut moins que pas de largeur. */
+    fun measureEdges(
+        cx: Float,
+        cy: Float,
+        dirX: Float,
+        dirY: Float,
+        raw: Boolean,
+    ): FloatArray? {
+        // Direction en PIXELS de masque : sans cette correction d'anisotropie
+        // le pas de balayage ne serait pas perpendiculaire au membre.
+        val fxp = dirX * mw
+        val fyp = dirY * mh
+        val fl = hypot(fxp, fyp)
+        if (fl <= 1e-3f) return null
+        val stepX = -(fyp / fl) / mw
+        val stepY = (fxp / fl) / mh
+        val maxSteps = (maxWidthFrac * maxOf(mw, mh)).toInt()
+
+        fun march(sign: Int): Int {
+            var miss = 0
+            var i = 1
+            while (i <= maxSteps) {
+                val v = sample(cx + sign * i * stepX, cy + sign * i * stepY, raw)
+                if (v < 0.5f) {
+                    // Trois échecs d'affilée : c'est un vrai bord, pas un trou
+                    // du masque.
+                    if (++miss >= 3) return i - miss
+                } else {
+                    miss = 0
+                }
+                i++
+            }
+            return maxSteps
+        }
+
+        val dPlus = march(1)
+        val dMinus = march(-1)
+        if (dPlus >= maxSteps || dMinus >= maxSteps) return null
+        return floatArrayOf(
+            cx + dPlus * stepX, cy + dPlus * stepY,
+            cx - dMinus * stepX, cy - dMinus * stepY,
+        )
+    }
+
+    val size: String get() = "${mw}x$mh"
+}
+
+/**
+ * Mesures géométriques d'un bijou, lues depuis `<nom>.fit.json` (produit par
+ * `tool/fit_analyzer.dart`).
+ *
+ * Le trou d'un bijou n'est pas « le point le plus proche de l'origine » mais
+ * le plus grand CYLINDRE VIDE qui le traverse de part en part, centre
+ * optimisé. C'est cette grandeur-là qui décide si un membre peut y passer, et
+ * c'est elle que l'analyseur mesure. Tous les champs sont optionnels : un
+ * fit.json incomplet retombe sur les replis de l'appelant.
+ */
+private class JewelFit(private val json: JSONObject) {
+    val holeAxis: String = json.optString("holeAxis", "Y")
+    val holeRadiusMin: Float = json.optDouble("holeRadiusMin", 0.0).toFloat()
+    val holeRadiusMax: Float = json.optDouble("holeRadiusMax", 0.0).toFloat()
+    val axisHalfExtent: Float = json.optDouble("axisHalfExtent", 0.0).toFloat()
+    val openingAt: Float = json.optDouble("openingAt", 0.0).toFloat()
+    val openingRadius: Float = json.optDouble("openingRadius", 0.0).toFloat()
+
+    val holeCenter: FloatArray = json.optJSONArray("holeCenter")?.let { a ->
+        floatArrayOf(
+            a.optDouble(0, 0.0).toFloat(),
+            a.optDouble(1, 0.0).toFloat(),
+            a.optDouble(2, 0.0).toFloat(),
+        )
+    } ?: floatArrayOf(0f, 0f, 0f)
+
+    /** Rayon libre vers ±[axis] du modèle. L'analyseur ne publie que les deux
+     *  directions PERPENDICULAIRES à l'axe du trou — demander celle de l'axe
+     *  lui-même retombe donc sur le petit axe, ce qui reste conservateur. */
+    fun radiusToward(axis: String): Float {
+        val v = json.optDouble("radiusToward$axis", -1.0).toFloat()
+        return if (v > 0f) v else holeRadiusMin
     }
 }
 
