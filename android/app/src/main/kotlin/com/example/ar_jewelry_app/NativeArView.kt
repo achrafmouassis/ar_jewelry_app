@@ -728,8 +728,22 @@ class NativeArView(
                 worldHandLen * kRingPerHand * scaleCorrection
             }
         }
-        smoothScale = if (smoothScale <= 0f) sRaw
-        else smoothScale + kScaleLerp * (sRaw - smoothScale)
+        // Un membre ne change pas de taille. On BORNE donc l'écart accepté par
+        // rapport à l'estimation courante AVANT de lisser : sans cette borne,
+        // un seul relevé aberrant (mesure de masque qui fuit, compensation de
+        // perspective qui s'emballe) tirait l'échelle pendant ~0,5 s — le
+        // bijou "respirait", ce qui casse l'illusion d'objet rigide bien plus
+        // qu'une taille légèrement fausse. Les logs montraient s passant de
+        // 0.49 à 1.20 sur une frame.
+        smoothScale = if (smoothScale <= 0f) {
+            sRaw
+        } else {
+            val bounded = sRaw.coerceIn(
+                smoothScale / kScaleMaxRatio,
+                smoothScale * kScaleMaxRatio,
+            )
+            smoothScale + kScaleLerp * (bounded - smoothScale)
+        }
         val s = smoothScale
 
         // Placement AXIAL mesuré : la manchette fait 2×kBandHalfHeight unités
@@ -1152,6 +1166,26 @@ class NativeArView(
         val wristIdx = if (leftD <= rightD) 15 else 16
         val elbowIdx = if (leftD <= rightD) 13 else 14
 
+        // VISIBILITÉ. Le modèle de pose renvoie TOUJOURS 33 landmarks, même
+        // pour les articulations hors cadre : il les invente. Un coude
+        // inventé donne un axe d'avant-bras aberrant, et comme cet axe pilote
+        // toute l'orientation de la manchette, le bijou saute d'un coup (54°
+        // mesurés dans les logs) dès que la pose redevient "fraîche". Le
+        // détecteur publie sa propre confiance — on la lit au lieu de la
+        // deviner.
+        val vw = lm[wristIdx].visibility().orElse(0f)
+        val ve = lm[elbowIdx].visibility().orElse(0f)
+        if (vw < kPoseMinVisibility || ve < kPoseMinVisibility) {
+            if (poseLogCount % 15 == 0) {
+                Log.i(
+                    TAG,
+                    "pose rejetée: visibilité poignet=$vw coude=$ve " +
+                        "(seuil $kPoseMinVisibility)",
+                )
+            }
+            return
+        }
+
         // Conversion image→écran identique à toScreen (recalculée ici : les
         // facteurs de recadrage dépendent de la géométrie de frame courante).
         val rot = frameRotation
@@ -1211,6 +1245,24 @@ class NativeArView(
         val candUpright = candidate(false)
         val useRot = score(candRot) >= score(candUpright)
         val chosen = if (useRot) candRot else candUpright
+
+        // LONGUEUR MINIMALE. Second filtre, indépendant de la visibilité : si
+        // coude et poignet se projettent quasiment au même endroit, la
+        // direction qui les relie n'a aucun contenu — c'est du bruit divisé
+        // par une longueur proche de zéro, donc amplifié. Les logs montraient
+        // une longueur planaire de 0.03 (3 % de l'écran) là où un avant-bras
+        // réel en occupe 30 à 50 %.
+        val forearmLen = hypot(chosen[0], chosen[1])
+        if (forearmLen < kPoseMinForearmLen) {
+            if (poseLogCount % 15 == 0) {
+                Log.i(
+                    TAG,
+                    "pose rejetée: avant-bras trop court à l'écran " +
+                        "($forearmLen < $kPoseMinForearmLen)",
+                )
+            }
+            return
+        }
 
         // Profondeur depuis les world landmarks (z invariant à la rotation
         // d'image), remise à l'échelle écran par le rapport des longueurs.
@@ -2198,6 +2250,21 @@ class NativeArView(
          *  (>~60° d'écart), l'axe pose est rejeté au profit de l'axe main. */
         private const val kPoseCoherenceDot = 0.5f
 
+        /** Confiance minimale publiée par le modèle de pose pour accepter un
+         *  landmark. En dessous, l'articulation est hors cadre et sa position
+         *  est INVENTÉE — le modèle renvoie toujours ses 33 points. */
+        private const val kPoseMinVisibility = 0.6f
+
+        /** Longueur planaire minimale coude→poignet (écran normalisé) pour
+         *  tirer une direction. En dessous, les deux points se superposent en
+         *  projection et la direction est du bruit divisé par ~zéro. */
+        private const val kPoseMinForearmLen = 0.10f
+
+        /** Écart max entre une nouvelle estimation d'échelle et l'échelle
+         *  courante, avant lissage. Un poignet ne double pas de taille d'une
+         *  frame à l'autre : au-delà, c'est un relevé aberrant. */
+        private const val kScaleMaxRatio = 1.5f
+
         /** Vitesse de convergence de l'échelle lissée (fraction par frame,
          *  ~60 fps → converge en ~0,5 s, insensible au bruit de mesure). */
         private const val kScaleLerp = 0.06f
@@ -2384,7 +2451,11 @@ class NativeArView(
         /** Lissage (fraction/frame) et borne de la correction latérale vers
          *  le centre mesuré de la silhouette. */
         private const val kSegOffsetLerp = 0.12f
-        private const val kSegOffsetMax = 0.08f
+
+        /** 0.08 laissait le bijou glisser latéralement de 8 % de l'écran (~90 px
+         *  sur une dalle 1080) au gré du bruit du masque. Le recentrage doit
+         *  corriger un biais de landmark, pas déplacer la pièce. */
+        private const val kSegOffsetMax = 0.04f
 
         /** Marge de l'occluseur au-delà du rayon estimé du poignet : absorbe
          *  l'erreur d'estimation pour que l'arrière de l'anneau ne
@@ -2421,7 +2492,14 @@ class NativeArView(
         /** Sous cette fraction "dans le plan écran" de l'axe, on arrête de
          *  compenser le raccourcissement de perspective (protège des
          *  divisions extrêmes quand le membre pointe vers la caméra). */
-        private const val kMinPlanarFactor = 0.35f
+        /*  0.35 autorisait la taille de main à être divisée par 0.35, soit
+         *  amplifiée ×2.86 — et les logs montrent planar passant de 0.94 à
+         *  0.48 d'une frame à l'autre, donc handLen de 1.17 à 2.17. Toute
+         *  l'échelle du bijou suivait. 0.55 borne l'amplification à ×1.8 : on
+         *  perd un peu de compensation quand le membre pointe franchement vers
+         *  l'objectif, mais c'est précisément le cas où la mesure est la moins
+         *  fiable. */
+        private const val kMinPlanarFactor = 0.55f
 
         /** Priorités de rendu Filament (0 = dessiné en premier, 7 en dernier).
          *
@@ -2438,11 +2516,21 @@ class NativeArView(
         private const val kWristOccLen = 4.0f
         private const val kRingOccLen = 7.0f
 
-        /** Avance temporelle (s) de la compensation de latence. */
-        private const val kLeadSeconds = 0.09f
+        /** Avance temporelle (s) de la compensation de latence.
+         *
+         *  L'extrapolation échange du RETARD contre de la GIGUE : elle ajoute
+         *  vitesse×avance à la position, or la vitesse est l'estimation la
+         *  plus bruitée d'un filtre One-Euro. 0.09 s était réglé pour masquer
+         *  la latence d'un pipeline qui tournait mal ; maintenant que la pose
+         *  est sur GPU, mieux vaut un léger retard qu'un bijou qui vibre. */
+        private const val kLeadSeconds = 0.05f
 
-        /** Déplacement prédictif max (unités normalisées). */
-        private const val kMaxLead = 0.06f
+        /** Déplacement prédictif max (unités normalisées).
+         *
+         *  0.06 autorisait un saut de 6 % de la hauteur d'écran, soit ~145 px
+         *  sur une dalle 2400 — un ordre de grandeur au-dessus de ce qu'une
+         *  compensation de latence doit produire. */
+        private const val kMaxLead = 0.025f
 
         /** Silence de détection au-delà duquel les filtres repartent de zéro. */
         private const val kResetAfterMs = 500L
