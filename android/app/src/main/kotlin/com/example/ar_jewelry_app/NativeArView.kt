@@ -2,14 +2,17 @@ package com.example.ar_jewelry_app
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.DashPathEffect
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.os.SystemClock
 import android.util.Log
+import android.util.Size
 import android.view.Choreographer
 import android.view.SurfaceView
 import android.view.View
@@ -22,6 +25,7 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -91,9 +95,60 @@ class NativeArView(
     args: Any?,
 ) : PlatformView {
 
+    /** Affichage LOCKSTEP (cf. [frameView]). Lu en premier : il décide quelle
+     *  vue caméra est construite. */
+    private val lockstep: Boolean =
+        (args as? Map<*, *>)?.get("lockstep") as? Boolean ?: false
+
+    /** Fusion par flux optique (cf. FlowTracker et fuseWithFlow). */
+    private val flowEnabled: Boolean =
+        (args as? Map<*, *>)?.get("flow") as? Boolean ?: false
+
     private val root = FrameLayout(context)
-    private val previewView = PreviewView(context).apply {
-        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+
+    /** Aperçu caméra « live » — chemin historique. Il affiche la frame la plus
+     *  récente, donc EN AVANCE sur le bijou, qui décrit une frame déjà
+     *  analysée. Null quand le lockstep prend la main. */
+    private val previewView: PreviewView? =
+        if (lockstep) {
+            null
+        } else {
+            PreviewView(context).apply {
+                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            }
+        }
+
+    /** Bitmap actuellement affiché en mode lockstep, avec sa géométrie. Écrit
+     *  par le thread de détection, lu par le thread UI au dessin. */
+    @Volatile
+    private var shownFrame: Bitmap? = null
+
+    private val framePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+    private val frameMatrix = Matrix()
+
+    /** Vue caméra du mode LOCKSTEP : elle ne montre QUE des frames dont la
+     *  détection est terminée, si bien que l'image et le bijou décrivent
+     *  toujours le même instant. C'est ce que font les essayages commerciaux —
+     *  l'affichage prend une ou deux frames de retard, invisible, et en échange
+     *  le bijou ne « glisse » plus jamais.
+     *
+     *  Vue ordinaire (pas de SurfaceView) : son `onDraw` passe par le pipeline
+     *  matériel de la fenêtre, exactement comme le guide de placement qui
+     *  s'affiche déjà correctement au-dessus du même empilement. Une
+     *  TextureView aurait été tentante, mais `lockCanvas` y rend un canevas
+     *  LOGICIEL : mettre à l'échelle une image plein écran par le CPU à 30 Hz
+     *  serait hors budget. */
+    private val frameView: View? = if (!lockstep) {
+        null
+    } else {
+        object : View(context) {
+            override fun onDraw(canvas: Canvas) {
+                val bmp = shownFrame ?: return
+                if (bmp.isRecycled) return
+                if (!buildFrameMatrix(bmp, width, height)) return
+                canvas.drawBitmap(bmp, frameMatrix, framePaint)
+            }
+        }
     }
     private val surfaceView = SurfaceView(context).apply {
         setZOrderMediaOverlay(true)
@@ -227,6 +282,27 @@ class NativeArView(
         ((args as? Map<*, *>)?.get("scaleCorrection") as? Number)
             ?.toFloat()?.coerceIn(0.7f, 1.4f) ?: 1.0f
 
+    // MESURE ABSOLUE de l'utilisateur (calibration à l'écran), en millimètres.
+    // 0 = non calibré. C'est la grandeur que la doc du CalibrationService décrit
+    // comme devant PILOTER la taille (pattern des essayages commerciaux :
+    // mesure absolue pour la taille, suivi seulement pour la pose). Elle était
+    // jusqu'ici réduite à un simple facteur multiplicatif (scaleCorrection)
+    // appliqué au seul repli anatomique — donc IGNORÉE dès que la segmentation
+    // fournissait une largeur, même fausse. On lit désormais la mesure brute
+    // pour pouvoir en dériver un rayon métrique exact (rayon = mm/2).
+    private val calibWristMm: Float =
+        ((args as? Map<*, *>)?.get("wristMm") as? Number)?.toFloat() ?: 0f
+    private val calibFingerMm: Float =
+        ((args as? Map<*, *>)?.get("fingerMm") as? Number)?.toFloat() ?: 0f
+
+    /** Rayon poignet/doigt VOULU en mètres, déduit de la calibration absolue.
+     *  0 tant que l'utilisateur n'a pas mesuré : on retombe alors sur le
+     *  pipeline (silhouette puis anatomie), comportement d'origine. */
+    private val calibWristRadiusM: Float =
+        if (calibWristMm > 1f) 0.5f * calibWristMm / 1000f else 0f
+    private val calibFingerRadiusM: Float =
+        if (calibFingerMm > 1f) 0.5f * calibFingerMm / 1000f else 0f
+
     // --- Mesures du bijou -------------------------------------------------
     // Produites hors-ligne par tool/fit_analyzer.dart et embarquées à côté du
     // GLB. Avant, chacune de ces grandeurs était une CONSTANTE écrite à la
@@ -267,15 +343,26 @@ class NativeArView(
     private val ringHoleRadius: Float = fit?.holeRadiusMin ?: kRingHoleFallback
 
     // --- Filtres One-Euro (mêmes constantes que la version Dart) -----------
-    private val fX = OneEuroFilter(minCutoff = 1.2f, beta = 0.02f)
-    private val fY = OneEuroFilter(minCutoff = 1.2f, beta = 0.02f)
+    // Le collier est un cas à part : il ne suit QUE la pose (bien plus bruitée
+    // que le hand_landmarker) et son axe dérive des OREILLES (lm7/8), que le
+    // modèle « invente » dès qu'elles sont un peu masquées — d'où le bijou qui
+    // « bouge dans tous les sens sans s'arrêter ». Or un collier est quasi
+    // statique sur le buste : on peut lisser BEAUCOUP plus fort sans latence
+    // perceptible. minCutoff/beta abaissés ⇒ fréquence de coupure basse ⇒ le
+    // jitter de landmarks est écrasé. La main, elle, doit rester vive : elle
+    // garde ses constantes d'origine.
+    private val fX = OneEuroFilter(
+        minCutoff = if (anchor == "neck") 0.35f else 1.2f,
+        beta = if (anchor == "neck") 0.006f else 0.02f,
+    )
+    private val fY = OneEuroFilter(
+        minCutoff = if (anchor == "neck") 0.35f else 1.2f,
+        beta = if (anchor == "neck") 0.006f else 0.02f,
+    )
     private val fHandDX = OneEuroFilter(minCutoff = 0.8f, beta = 0.01f)
     private val fHandDY = OneEuroFilter(minCutoff = 0.8f, beta = 0.01f)
-    // Orientation : lissage plus fort que la position (minCutoff bas) — les
-    // micro-oscillations d'angle donnent une impression de "flottement" du
-    // bijou ; le beta laisse les vraies rotations de la main passer vite.
-    // La normale (roulis) est la plus bruitée des mesures (logs : dérives
-    // jusqu'à l'hémisphère arrière) → lissage encore plus fort.
+    // L'orientation n'est plus lissée ici : elle l'est d'un bloc, sur la
+    // rotation assemblée (cf. fQuat).
     // Rapport largeur de doigt / longueur de main (cf. onHands). Fortement
     // lissé : c'est une constante morphologique, elle ne doit pas "respirer".
     private val fPitch = OneEuroFilter(minCutoff = 0.3f, beta = 0.005f)
@@ -283,8 +370,94 @@ class NativeArView(
     @Volatile
     private var fingerPitchRatio = 0f
 
-    private val fAxis = Array(3) { OneEuroFilter(minCutoff = 0.6f, beta = 0.015f) }
-    private val fNorm = Array(3) { OneEuroFilter(minCutoff = 0.35f, beta = 0.01f) }
+    // --- Échelle : mesure MÉTRIQUE verrouillée -----------------------------
+    // Le pipeline ré-estimait à chaque frame le rayon du membre, en arbitrant
+    // entre masque de segmentation, maintien de 4 s et ratio de population.
+    // Ces sources ne s'accordent pas (le garde-fou accepte jusqu'à 1.70× entre
+    // elles) : chaque bascule était un saut de taille, et le lissage lent le
+    // transformait en « respiration » du bijou. Or le rayon du poignet d'un
+    // utilisateur est CONSTANT ; seule sa distance à la caméra varie.
+    //
+    // On sépare donc les deux :
+    //  - le rayon en MÈTRES est mesuré sur les premières frames fiables puis
+    //    VERROUILLÉ sur la médiane (insensible aux relevés aberrants) ;
+    //  - la taille apparente en devient une simple conséquence de la distance,
+    //    via unitsPerMeter (cf. plus bas).
+    //
+    // Effet : plus aucune commutation de source, donc plus de saut de taille ;
+    // et le bijou grossit/rétrécit encore correctement quand la main approche.
+    private val lockWristRadius = LockedMedian("rayon poignet (m)", kLockSamples, kRelockRatio)
+    private val lockFingerRadius = LockedMedian("rayon doigt (m)", kLockSamples, kRelockRatio)
+    private val lockNeckRadius = LockedMedian("rayon cou (m)", kLockSamples, kRelockRatio)
+
+    // Longueur PLANAIRE (composantes x,y) du segment de référence dans les
+    // world landmarks MÉTRIQUES : lm0→lm9 pour la main, ligne d'épaules pour le
+    // collier. Confrontée à la même longueur mesurée à l'écran, elle donne le
+    // facteur unités-monde/mètre — c'est-à-dire la distance.
+    //
+    // Prendre les composantes x,y des world landmarks (et non la longueur 3D)
+    // est ce qui rend la mesure INSENSIBLE À L'INCLINAISON : le raccourcissement
+    // de perspective affecte identiquement le numérateur et le dénominateur, il
+    // se simplifie. C'est la même recette que la remise à l'échelle de la
+    // profondeur dans onPose — et elle remplace avantageusement la division par
+    // `planar`, dont les logs montraient qu'elle amplifiait la taille jusqu'à
+    // ×1.8 sur un simple basculement de la main.
+    @Volatile
+    private var metricPlanar = 0f
+
+    /** Longueur 3D MÉTRIQUE du même segment de référence (mètres). Contrairement
+     *  à [metricPlanar], elle ne se raccourcit pas quand le membre s'incline —
+     *  c'est donc elle qu'il faut multiplier par le facteur distance pour
+     *  obtenir une estimation anatomique qui ne « respire » pas. */
+    @Volatile
+    private var metric3D = 0f
+
+    /** Demi-écart métrique entre MCP voisins = rayon du doigt, en mètres.
+     *  Brut : c'est la médiane du verrou qui filtre, pas un passe-bas. */
+    @Volatile
+    private var fingerRadiusMetric = 0f
+
+    /** Dernier état de suivi publié par le thread de détection, daté de la
+     *  frame dont il est issu. Lu par la boucle de rendu, qui l'extrapole à
+     *  SA propre date (cf. TrackSnapshot). */
+    @Volatile
+    private var track: TrackSnapshot? = null
+
+    // --- RIGIDITÉ : UN SEUL filtre, sur la rotation ENTIÈRE ----------------
+    // Avant, les trois vecteurs de la base étaient filtrés SÉPARÉMENT puis
+    // recollés par Gram-Schmidt, avec des constantes de temps différentes :
+    // position ~133 ms, axe du membre ~265 ms, normale de paume ~455 ms,
+    // roulis ~150 ms. Un objet réellement porté n'a qu'UNE pose : quand on
+    // tourne le poignet, le bijou se translatait donc en 133 ms mais pivotait
+    // en 455 ms. C'est cette dissociation qu'on lit comme « pas attaché », et
+    // aucun réglage de constante ne pouvait la corriger — il fallait supprimer
+    // la structure qui la produit.
+    //
+    // Deux raisons de filtrer un QUATERNION plutôt que trois vecteurs :
+    //  - une seule constante de temps, donc position et orientation arrivent
+    //    ENSEMBLE ;
+    //  - l'interpolation reste dans le groupe des rotations. Trois vecteurs
+    //    filtrés indépendamment ne forment plus une base orthonormée : le
+    //    résultat n'est la rotation d'AUCUNE pose réelle, c'est un mélange de
+    //    trois directions en retard les unes sur les autres. Gram-Schmidt le
+    //    ré-orthogonalise après coup, ce qui masque l'incohérence sans la
+    //    supprimer (et introduit du cisaillement selon l'ordre des colonnes).
+    //
+    // Même constante que la position (fX/fY), délibérément : c'est la seule
+    // façon que la translation et la rotation soient perçues simultanées — donc
+    // le collier reçoit aussi ici le lissage renforcé (cf. fX/fY). C'est la
+    // rotation qui portait l'essentiel de la danse du collier : l'axe du cou
+    // pivote dès que les oreilles inventées bougent.
+    private val fQuat = QuatFilter(
+        minCutoff = if (anchor == "neck") 0.35f else 1.2f,
+        beta = if (anchor == "neck") 0.006f else 0.02f,
+    )
+
+    /** Le thread de détection demande la remise à zéro de [fQuat] (main perdue
+     *  puis retrouvée) ; la boucle de rendu, seule propriétaire du filtre, la
+     *  consomme. Voir resetFilters. */
+    @Volatile
+    private var poseResetPending = false
     // Lu par la boucle de rendu (délai de grâce), écrit par le thread analyse.
     @Volatile
     private var lastHandMs = 0L
@@ -303,6 +476,12 @@ class NativeArView(
     private val auxProviders = mutableListOf<UbershaderProvider>()
     private val auxLoaders = mutableListOf<AssetLoader>()
     private val auxResourceLoaders = mutableListOf<ResourceLoader>()
+    // Assets auxiliaires (occluseur, ombre) appariés à auxLoaders par index :
+    // doivent être DÉTRUITS au dispose avant que le ModelViewer ne détruise le
+    // moteur, sinon leurs MaterialInstance (base_lit_opaque) survivent et
+    // Filament panique (SIGABRT « destroying material ... instances still
+    // alive ») — le crash observé en quittant/recréant l'écran.
+    private val auxAssets = mutableListOf<FilamentAsset>()
     private var occAsset: FilamentAsset? = null
 
     /** Jupe d'ombre de contact (cf. loadContactShadow). */
@@ -314,6 +493,20 @@ class NativeArView(
     /** La priorité de rendu du bijou a-t-elle pu être posée (cf. chargement
      *  asynchrone des ressources par ModelViewer) ? */
     private var prioritiesApplied = false
+
+    // --- Décisions verrouillées (cf. StickyChoice) -------------------------
+    // Conventions de repère : propriétés du device, décidées une fois puis
+    // tenues. Touchées uniquement depuis le thread de détection.
+    private val stickyArmRot = StickyChoice("rotation bras", kConventionVotes)
+    private val stickyArmMask = StickyChoice("masque bras", kConventionVotes)
+    private val stickyNeckRot = StickyChoice("rotation cou", kConventionVotes)
+    private val stickyNeckMask = StickyChoice("masque cou", kConventionVotes)
+
+    /** Source de l'axe de l'avant-bras : pose (true) ou main (false), avec
+     *  hystérésis. Voir le bloc correspondant dans [onHands]. */
+    private var usePoseAxis = false
+    private var poseSourceVotes = 0
+
 
     // --- État partagé détection → rendu (écrit par MediaPipe, lu au rendu).
     // Position cible [0..1] en espace d'affichage, déjà lissée + extrapolée.
@@ -358,9 +551,26 @@ class NativeArView(
     // Échelle lissée du bijou (boucle de rendu uniquement) ; 0 = à réinitialiser.
     private var smoothScale = 0f
 
+    /** Âge de l'instantané extrapolé à la dernière frame rendue (ms) — c'est la
+     *  LATENCE RÉELLE du pipeline, journalisée pour pouvoir la constater au
+     *  lieu de la supposer. Boucle de rendu uniquement. */
+    private var lastAnchorAgeMs = 0f
+
     // Source de l'axe utilisée à la dernière détection (diagnostic).
     @Volatile
     private var lastAxisSource = "?"
+
+    // Identité de l'instance, pour tracer le cycle de vie dans logcat : chaque
+    // recréation de la PlatformView (changement de clé côté Flutter) construit
+    // une NOUVELLE NativeArView et détruit l'ancienne. Si l'app « sort toute
+    // seule », c'est presque toujours une recréation-dispose (ex. la
+    // calibration qui se charge en asynchrone juste après l'ouverture et change
+    // la clé). Ces logs le rendent visible sans avoir à le deviner.
+    private val instanceId = ++instanceCounter
+    private val createdAtMs = SystemClock.uptimeMillis()
+    // Empêche la double destruction des assets auxiliaires (listener de
+    // détachement + dispose Flutter peuvent tous deux se déclencher).
+    private var auxDestroyed = false
 
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
@@ -375,7 +585,9 @@ class NativeArView(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT,
         )
-        root.addView(previewView, mp)
+        // Exactement une des deux vues caméra existe (cf. lockstep).
+        previewView?.let { root.addView(it, mp) }
+        frameView?.let { root.addView(it, mp) }
         root.addView(surfaceView, mp)
         root.addView(guideView, mp)
         // Le guide ne concerne que le bracelet (cadrage du poignet).
@@ -390,6 +602,25 @@ class NativeArView(
         val uiHelper = UiHelper(UiHelper.ContextErrorPolicy.DONT_CHECK).apply {
             isOpaque = false
         }
+        // CRUCIAL — enregistré AVANT la construction du ModelViewer. Filament
+        // ModelViewer ajoute, dans son constructeur, son PROPRE listener de
+        // détachement qui appelle Engine.destroy() dès que la SurfaceView quitte
+        // la fenêtre (quitter l'écran OU recréation de la PlatformView). Ce
+        // destroy panique si une MaterialInstance de nos assets auxiliaires
+        // (occluseur) est encore vivante — le SIGABRT « base_lit_opaque … still
+        // alive ». Notre dispose() Flutter arrive TROP TARD (après le
+        // détachement, cf. logs : aucun DISPOSE avant le crash). En insérant
+        // NOTRE listener en premier, Android l'invoque avant celui du
+        // ModelViewer : on relâche l'occluseur pendant que le moteur vit encore,
+        // et Engine.destroy ne trouve plus d'instance vivante.
+        surfaceView.addOnAttachStateChangeListener(
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {}
+                override fun onViewDetachedFromWindow(v: View) {
+                    destroyAuxAssetsOnce("détachement")
+                }
+            },
+        )
         modelViewer = ModelViewer(surfaceView, uiHelper = uiHelper, manipulator = manipulator)
         modelViewer.view.blendMode = com.google.android.filament.View.BlendMode.TRANSLUCENT
         modelViewer.renderer.clearOptions = Renderer.ClearOptions().apply {
@@ -399,13 +630,20 @@ class NativeArView(
 
         loadModel()
         loadOccluder()
-        loadContactShadow()
+        // Ombre de contact DÉSACTIVÉE : la jupe noire dégradée n'a de sens que
+        // si l'occluseur en retranche PARFAITEMENT la moitié avant. En pratique
+        // sa moitié tournée vers la caméra restait lisible comme une tache
+        // sombre sur la peau (surtout sur l'avant-bras large de la manchette) —
+        // exactement l'artefact « ombre visible » signalé. On la coupe : le
+        // rendu sans halo parasite est préférable à un contact approximatif.
+        if (kContactShadowEnabled) loadContactShadow()
         loadEnvironment()
         setupHandLandmarker()
         setupPoseLandmarker()
         startCamera(activity)
         logStartupSummary()
         choreographer.postFrameCallback(frameCallback)
+        Log.i(TAG, "CYCLE ► instance #$instanceId CRÉÉE (total vivantes ~$instanceCounter)")
     }
 
     /**
@@ -445,8 +683,25 @@ class NativeArView(
         )
         Log.i(
             TAG,
+            "  AFFICHAGE  : " +
+                if (lockstep) {
+                    "LOCKSTEP (frame analysée + sa pose, demandé " +
+                        "${kLockstepAnalysisSize.width}x${kLockstepAnalysisSize.height})"
+                } else {
+                    "aperçu live (PreviewView) — bijou en retard sur l'image"
+                } +
+                "  flux=" +
+                if (flowEnabled) {
+                    "ACTIF (fenêtre $kFlowWin px, correction $kFlowCorrect)"
+                } else {
+                    "inactif (lissage temporel seul)"
+                },
+        )
+        Log.i(
+            TAG,
             "  ÉTAGE B    : poignet=segmentation doigt=squelette3D cou=segmentation" +
-                "  calibration=$scaleCorrection",
+                "  calibration=$scaleCorrection" +
+                "  morphologie=verrouillée sur $kLockSamples mesures (médiane)",
         )
         Log.i(
             TAG,
@@ -474,6 +729,15 @@ class NativeArView(
         val asset = modelViewer.asset ?: return
         val tcm = modelViewer.engine.transformManager
         val inst = tcm.getInstance(asset.root)
+
+        // UNE seule lecture d'horloge pour toute la frame. Les cinq lectures
+        // séparées d'avant portaient des instants différents : les deux filtres
+        // temporels (ancre et pose) calculaient leur dt sur des bases
+        // décalées, et les tests de fraîcheur des mesures pouvaient tomber de
+        // part et d'autre d'une milliseconde au sein d'une même frame. L'effet
+        // est petit, mais c'est précisément le genre d'incohérence qui rend un
+        // comportement non reproductible — donc indébogable.
+        val nowMs = SystemClock.uptimeMillis()
 
         // ModelViewer charge les ressources en asynchrone et ajoute ses
         // renderables à la scène au fil de l'eau : au retour de loadModelGlb,
@@ -515,9 +779,14 @@ class NativeArView(
         // main + mesure du bras (les essayages commerciaux imposent le même
         // cadrage) ; fondu de sortie quand tout est verrouillé.
         val segFreshNow = wristSeg != null &&
-            SystemClock.uptimeMillis() - wristSegMs < kSegFreshMs
+            nowMs - wristSegMs < kSegFreshMs
         if (anchor == "wrist") {
-            val target = if (hasHand && segFreshNow) 0f else 1f
+            // Le guide s'efface dès que le suivi tient : main présente ET une
+            // échelle acquise (silhouette fraîche, ou déjà mémorisée et gelée —
+            // sinon le guide réapparaissait à chaque bouffée d'échec du masque,
+            // exactement ce qu'on voit sur les captures). Il ne revient que si
+            // la main est franchement perdue.
+            val target = if (hasHand && (segFreshNow || smoothScale > 0f)) 0f else 1f
             guideView.alpha += kGuideFade * (target - guideView.alpha)
         }
         // Une détection manquée ne doit PAS faire disparaître le bijou : le
@@ -527,7 +796,7 @@ class NativeArView(
         // produisait une disparition SUIVIE d'une réapparition dont la taille
         // reconvergeait lentement (kScaleLerp) — soit le bijou qui "regonfle",
         // ce qui trahit l'illusion bien plus qu'une pose légèrement figée.
-        val heldMs = SystemClock.uptimeMillis() - lastHandMs
+        val heldMs = nowMs - lastHandMs
         if (!hasHand && heldMs > kHoldAfterLossMs) {
             tcm.setTransform(inst, kHiddenTransform)
             occAsset?.let { tcm.setTransform(tcm.getInstance(it.root), kHiddenTransform) }
@@ -555,22 +824,47 @@ class NativeArView(
         )
         var norm = normVec.copyOf()
 
-        // Taille de la main en unités monde (le plein écran normalisé [0..1]
-        // couvre 2·halfW × 2·halfH). La distance lm0–lm9 est mesurée à
-        // l'ÉCRAN : quand la main s'incline vers la caméra elle se raccourcit
-        // par perspective alors que le poignet garde sa largeur → on divise
-        // par la fraction de l'axe restée dans le plan écran.
+        // Longueur du segment de référence PROJETÉE à l'écran, en unités monde
+        // (le plein écran normalisé [0..1] couvre 2·halfW × 2·halfH).
+        val worldHandPlanar = hypot(handDX * 2f * halfW, handDY * 2f * halfH)
+
+        // FACTEUR DISTANCE. Le même segment, mesuré en projection écran (au
+        // numérateur) et en mètres dans le plan caméra (au dénominateur) :
+        // leur rapport dit combien d'unités monde vaut un mètre à la distance
+        // où se trouve le membre. C'est la SEULE grandeur qui doit varier avec
+        // le mouvement — tout le reste de l'échelle est une constante
+        // morphologique.
+        //
+        // Le raccourcissement de perspective se simplifie entre les deux
+        // termes : plus besoin de diviser par `planar`, dont le clamp
+        // kMinPlanarFactor autorisait une amplification ×1.8 déclenchée par un
+        // simple basculement de la main (logs : planar 0.94 → 0.48 d'une frame
+        // à l'autre, et toute la taille du bijou qui suivait).
+        val unitsPerMeter =
+            if (metricPlanar > 1e-4f) worldHandPlanar / metricPlanar else -1f
+
+        // Longueur de main compensée « à l'ancienne » : ne sert plus qu'aux
+        // replis, tant que les world landmarks n'ont pas encore livré de
+        // référence métrique.
         val planar = hypot(axis[0], axis[1]).coerceAtLeast(kMinPlanarFactor)
-        val worldHandLen =
-            hypot(handDX * 2f * halfW, handDY * 2f * halfH) / planar
+        val worldHandLen = worldHandPlanar / planar
 
         // Mesure fraîche de la silhouette du bras (masque de segmentation) ?
         val seg = wristSeg
         // Estimation anatomique (ratio de population sur un modèle de main
         // générique, d'où la correction morphologique) : sert de repli ET de
         // référence de vraisemblance pour la mesure du masque.
-        val anatomicalRadius =
-            0.5f * kWristWidthPerHand * worldHandLen * scaleCorrection
+        // Bâtie sur la longueur 3D métrique × facteur distance dès qu'elle est
+        // disponible : c'est ce qui rend le garde-fou de vraisemblance
+        // FIABLE. Adossé à worldHandLen (donc à la division par `planar`),
+        // il variait de ±80 % au gré de l'inclinaison de la main et rejetait
+        // alors de bonnes mesures — ou en laissait passer de mauvaises.
+        val anatomicalRadius = 0.5f * kWristWidthPerHand * scaleCorrection *
+            if (metric3D > 0f && unitsPerMeter > 0f) {
+                metric3D * unitsPerMeter
+            } else {
+                worldHandLen
+            }
         val measuredRadius = if (anchor == "wrist" && seg != null && segFreshNow) {
             0.5f * hypot(seg[2] * 2f * halfW, seg[3] * 2f * halfH)
         } else {
@@ -585,8 +879,18 @@ class NativeArView(
         // mesure à l'estimation anatomique — même principe que le garde-fou
         // pose/main sur l'axe — et on rejette ce qui s'en écarte trop. Un bras
         // réel ne peut pas faire le double du poignet déduit de sa main.
+        // Référence de VRAISEMBLANCE (pas de dimensionnement) : la mesure
+        // absolue de l'utilisateur si elle existe — bien plus fiable —, sinon
+        // l'estimation anatomique. Elle ne sert QU'À borner la silhouette
+        // (rejeter les fuites dans le torse ou l'autre bras). La taille, elle,
+        // vient de la silhouette écran, qui n'a besoin d'aucun facteur main.
+        val expectedWristRadius = when {
+            calibWristRadiusM > 0f && unitsPerMeter > 0f ->
+                calibWristRadiusM * unitsPerMeter
+            else -> anatomicalRadius
+        }
         val segRatio =
-            if (anatomicalRadius > 1e-4f) measuredRadius / anatomicalRadius else -1f
+            if (expectedWristRadius > 1e-4f) measuredRadius / expectedWristRadius else -1f
         val segFresh = measuredRadius > 0f &&
             segRatio in kSegRadiusMinRatio..kSegRadiusMaxRatio
 
@@ -595,8 +899,9 @@ class NativeArView(
         // de l'axe, l'ancre main garde le placement voulu du bracelet). Le
         // landmark poignet peut être biaisé vers un bord du bras — c'est ce
         // biais qui donne l'impression d'un bijou posé sur le dessus.
-        var aX = smX
-        var aY = smY
+        val anchor0 = anchorAt(nowMs)
+        var aX = anchor0[0]
+        var aY = anchor0[1]
         run {
             // Perpendiculaire écran de l'axe : axe écran = (x, -y) → perp = (y, x).
             var p0 = axis[1]
@@ -606,7 +911,8 @@ class NativeArView(
                 p0 /= pl
                 p1 /= pl
                 if (segFresh) {
-                    val off = (seg!![0] - smX) * p0 + (seg[1] - smY) * p1
+                    val off = (seg!![0] - anchor0[0]) * p0 +
+                        (seg[1] - anchor0[1]) * p1
                     segOff += kSegOffsetLerp *
                         (off.coerceIn(-kSegOffsetMax, kSegOffsetMax) - segOff)
                 } else {
@@ -617,18 +923,14 @@ class NativeArView(
             }
         }
 
-        // Échelle FORTEMENT lissée : les logs montraient s oscillant de ±20 %
-        // (bruit de mesure + compensation de perspective) → le bracelet
-        // "respirait", ce qui casse l'illusion d'objet rigide porté. La
-        // taille réelle d'une main ne change pas : convergence lente.
-        //
-        // Bracelet : l'échelle est déduite du bras RÉEL. Priorité à la
-        // largeur MESURÉE de la silhouette (masque de segmentation, comme les
-        // essayages commerciaux) ; repli sur l'estimation anatomique depuis
-        // la taille de main si la mesure n'est pas fraîche. Le Ø intérieur
-        // du trou est ensuite posé à kBraceletClearance × cette largeur :
-        // le bracelet prend exactement la taille du bras, l'entoure, et le
-        // léger jeu + l'occlusion arrière créent l'effet de traversée.
+        // Bracelet : l'échelle est déduite du bras RÉEL, mesuré sur la
+        // silhouette (masque de segmentation, comme les essayages commerciaux)
+        // puis VERROUILLÉ en mètres — le lissage lourd d'autrefois ne servait
+        // qu'à masquer le va-et-vient entre sources concurrentes, il n'a plus
+        // lieu d'être (cf. LockedMedian). Le Ø intérieur du trou est posé à
+        // kBraceletClearance × cette largeur : le bracelet prend exactement la
+        // taille du bras, l'entoure, et le léger jeu + l'occlusion arrière
+        // créent l'effet de traversée.
         // NB : la largeur silhouette d'un cylindre perpendiculaire à son axe
         // projeté = son diamètre, quel que soit le basculement → pas de
         // correction de perspective à appliquer sur cette mesure.
@@ -663,22 +965,63 @@ class NativeArView(
             }
         }
 
-        val worldWristRadius = if (segFresh) measuredRadius else anatomicalRadius
+        // VERROUILLAGE MÉTRIQUE du rayon du poignet.
+        //
+        // Chaque mesure de silhouette jugée vraisemblable est convertie en
+        // MÈTRES (division par le facteur distance) et offerte au verrou. Tant
+        // qu'il se remplit, il renvoie la médiane des mesures déjà vues — donc
+        // une valeur qui se stabilise au lieu de sauter ; une fois plein, il
+        // fige et ne bouge plus de la session.
+        //
+        // Ce qui disparaît ici : l'arbitrage mesuré / maintenu 4 s / ratio
+        // anatomique refait à chaque frame. C'est lui qui faisait varier la
+        // taille de 20 à 30 % à la cadence des échecs de mesure du masque,
+        // c'est-à-dire au moindre mouvement du bras. Le diamètre du poignet de
+        // l'utilisateur est une constante : on la mesure, puis on la tient.
+        if (segFresh && unitsPerMeter > 0f) {
+            lockWristRadius.offer(measuredRadius / unitsPerMeter)
+        }
+        val worldWristRadius = when {
+            // AUTORITÉ D'ÉCHELLE : la silhouette du bras À L'ÉCRAN. C'est un
+            // rayon en unités écran PUR — il ne passe par AUCUN facteur dérivé
+            // de la main (unitsPerMeter). Il suit donc la distance tout seul
+            // (bras plus proche = silhouette plus large) et reste INSENSIBLE à
+            // la pose de la main : c'est exactement ce qui manquait, la taille
+            // sautait parce qu'elle dépendait de la longueur projetée lm0→lm9,
+            // qui change entre poing fermé et main ouverte inclinée.
+            segFresh -> measuredRadius
+            // Replis de BOOTSTRAP uniquement, le temps qu'une première
+            // silhouette exploitable arrive (ensuite le gel prend le relais,
+            // cf. mise à jour de smoothScale). Ordre : mesure absolue de
+            // l'utilisateur > verrou métrique > anatomie.
+            calibWristRadiusM > 0f && unitsPerMeter > 0f ->
+                calibWristRadiusM * unitsPerMeter
+            lockWristRadius.value > 0f && unitsPerMeter > 0f ->
+                lockWristRadius.value * unitsPerMeter
+            else -> anatomicalRadius
+        }
         // Collier : le canal "taille de main" porte la largeur d'épaules. Le
         // rayon du cou en est déduit anatomiquement, et l'échelle est posée
         // pour que l'OUVERTURE du plastron (rayon intérieur mesuré sur le
         // GLB : 0.507 unité) épouse le cou.
-        val worldShoulderW = hypot(handDX * 2f * halfW, handDY * 2f * halfH)
+        val worldShoulderW = worldHandPlanar
         // Rayon du COU : mesuré sur la silhouette quand la mesure est fraîche
         // ET vraisemblable, sinon déduit de la largeur d'épaules par ratio
         // anatomique. Même garde-fou que le poignet : le balayage peut fuir
         // dans les cheveux ou le col, et une mesure fausse vaut moins qu'une
         // estimation honnête.
-        val neckAnatomical =
-            0.5f * kNeckWidthPerShoulder * worldShoulderW * scaleCorrection
+        // Même correction que pour le poignet (cf. anatomicalRadius) : la
+        // largeur d'épaules 3D métrique ne se raccourcit pas quand le sujet
+        // se tourne, la largeur projetée si.
+        val neckAnatomical = 0.5f * kNeckWidthPerShoulder * scaleCorrection *
+            if (metric3D > 0f && unitsPerMeter > 0f) {
+                metric3D * unitsPerMeter
+            } else {
+                worldShoulderW
+            }
         val nseg = neckSeg
         val neckMeasured = if (anchor == "neck" && nseg != null &&
-            SystemClock.uptimeMillis() - neckSegMs < kSegFreshMs
+            nowMs - neckSegMs < kSegFreshMs
         ) {
             0.5f * hypot(nseg[2] * 2f * halfW, nseg[3] * 2f * halfH)
         } else {
@@ -688,7 +1031,17 @@ class NativeArView(
             if (neckAnatomical > 1e-4f) neckMeasured / neckAnatomical else -1f
         val neckFresh = neckMeasured > 0f &&
             neckRatio in kSegRadiusMinRatio..kSegRadiusMaxRatio
-        val worldNeckRadius = if (neckFresh) neckMeasured else neckAnatomical
+        // Même verrouillage métrique que pour le poignet (cf. worldWristRadius) :
+        // ici la référence de distance est la ligne d'épaules.
+        if (neckFresh && unitsPerMeter > 0f) {
+            lockNeckRadius.offer(neckMeasured / unitsPerMeter)
+        }
+        val worldNeckRadius = when {
+            lockNeckRadius.value > 0f && unitsPerMeter > 0f ->
+                lockNeckRadius.value * unitsPerMeter
+            neckFresh -> neckMeasured
+            else -> neckAnatomical
+        }
 
         val sRaw = if (anchor == "neck") {
             // On confronte au rayon MINIMAL de l'ouverture, pas au rayon
@@ -720,12 +1073,33 @@ class NativeArView(
             // ce qui se lisait comme un objet flottant. Il avait été réglé
             // « visuellement » à une époque où le pivot était décalé de 0.32 :
             // l'erreur de taille compensait l'erreur de position.
+            //
+            // Comme pour le poignet, le rayon du doigt est VERROUILLÉ en
+            // mètres : il n'a pas besoin du masque de segmentation, l'écart
+            // entre MCP voisins est déjà porté par les world landmarks.
+            // La correction morphologique s'applique ici — contrairement au
+            // poignet — parce que cette mesure vient de l'ajustement d'un
+            // modèle de main GÉNÉRIQUE, là où la silhouette est celle de
+            // l'utilisateur.
+            if (fingerRadiusMetric > 0f) {
+                lockFingerRadius.offer(fingerRadiusMetric * scaleCorrection)
+            }
+            val lockedFinger = lockFingerRadius.value
             val ratio = fingerPitchRatio
-            if (ratio > 0f) {
-                val fingerR = 0.5f * worldHandLen * ratio * scaleCorrection
-                kRingClearance * fingerR / holeRadiusLateral
-            } else {
-                worldHandLen * kRingPerHand * scaleCorrection
+            when {
+                // PRIORITÉ ABSOLUE : la mesure de l'utilisateur (cf. poignet).
+                // Rayon exact du doigt en mètres → unités monde par la distance.
+                calibFingerRadiusM > 0f && unitsPerMeter > 0f ->
+                    kRingClearance * (calibFingerRadiusM * unitsPerMeter) /
+                        holeRadiusLateral
+                lockedFinger > 0f && unitsPerMeter > 0f ->
+                    kRingClearance * (lockedFinger * unitsPerMeter) /
+                        holeRadiusLateral
+                ratio > 0f ->
+                    kRingClearance *
+                        (0.5f * worldHandLen * ratio * scaleCorrection) /
+                        holeRadiusLateral
+                else -> worldHandLen * kRingPerHand * scaleCorrection
             }
         }
         // Un membre ne change pas de taille. On BORNE donc l'écart accepté par
@@ -735,38 +1109,43 @@ class NativeArView(
         // bijou "respirait", ce qui casse l'illusion d'objet rigide bien plus
         // qu'une taille légèrement fausse. Les logs montraient s passant de
         // 0.49 à 1.20 sur une frame.
-        smoothScale = if (smoothScale <= 0f) {
-            sRaw
-        } else {
-            val bounded = sRaw.coerceIn(
-                smoothScale / kScaleMaxRatio,
-                smoothScale * kScaleMaxRatio,
-            )
-            smoothScale + kScaleLerp * (bounded - smoothScale)
+        // Une fois la morphologie verrouillée, sRaw ne porte plus de bruit de
+        // mesure : il ne varie que par la DISTANCE, qui est un vrai signal. Le
+        // lissage lent (0,5 s) devient alors un défaut — le bijou mettrait une
+        // demi-seconde à grandir quand la main approche. On converge donc
+        // nettement plus vite dès que le verrou a pris.
+        // La calibration absolue vaut un verrou d'emblée : le rayon métrique est
+        // connu et exact, sRaw ne porte plus que le signal de distance. On
+        // converge donc vite dès la 1re frame, sans attendre kLockSamples mesures.
+        val scaleLocked = when (anchor) {
+            "wrist" -> calibWristRadiusM > 0f || lockWristRadius.isLocked
+            "neck" -> lockNeckRadius.isLocked
+            else -> calibFingerRadiusM > 0f || lockFingerRadius.isLocked
+        }
+        val lerp = if (scaleLocked) kScaleLerpLocked else kScaleLerp
+        // GEL de l'échelle du bracelet quand la silhouette est périmée. Le
+        // balayage du masque échoue par bouffées (main qui s'ouvre, avant-bras
+        // qui pointe vers l'objectif) : replier alors sur une estimation
+        // dérivée de la main faisait s'effondrer la taille d'un coup (les deux
+        // captures : ~largeur du bras poing fermé, minuscule main ouverte). Or
+        // un poignet ne change pas de taille en une fraction de seconde. Tant
+        // que la main est là mais la silhouette absente, on TIENT donc la
+        // dernière échelle valide ; elle se remet à jour dès qu'une silhouette
+        // fraîche revient. C'est le gel, pas le repli, qui tue l'effondrement.
+        val wristHoldScale = anchor == "wrist" && !segFresh && smoothScale > 0f
+        smoothScale = when {
+            smoothScale <= 0f -> sRaw
+            wristHoldScale -> smoothScale
+            else -> {
+                val bounded = sRaw.coerceIn(
+                    smoothScale / kScaleMaxRatio,
+                    smoothScale * kScaleMaxRatio,
+                )
+                smoothScale + lerp * (bounded - smoothScale)
+            }
         }
         val s = smoothScale
 
-        // Placement AXIAL mesuré : la manchette fait 2×kBandHalfHeight unités
-        // de haut le long du bras (profil GLB mesuré : bande pleine hauteur,
-        // rayon intérieur constant). Centrée sur le poignet, elle
-        // chevaucherait la paume — c'est ce chevauchement qui donnait le
-        // rendu "posé sur la main". On place son bord supérieur au pli du
-        // poignet : centre = poignet + (demi-hauteur + marge) vers le coude
-        // (-axis). La composante planaire brute de l'axe raccourcit
-        // naturellement l'offset écran quand le bras plonge vers la caméra.
-        // Collier : même piège que la manchette, en plus marqué — l'ouverture
-        // du plastron est à Y=+0.90 dans le modèle, PAS à son centre. Centrer
-        // la pièce sur le cou la placerait ~1 unité trop haut, l'anneau
-        // au-dessus du menton. On descend donc l'origine du modèle de
-        // 0.90×s sous le creux sternal : l'ouverture y affleure et la pièce
-        // retombe sur la poitrine.
-        val alongOff = when (anchor) {
-            "wrist" -> s * (bandHalfHeight + kBandGap)
-            "neck" -> s * openingAt
-            else -> 0f
-        }
-        val wx = (aX - 0.5f) * 2f * halfW - axis[0] * alongOff
-        val wy = (0.5f - aY) * 2f * halfH - axis[1] * alongOff
         // Gram-Schmidt : composante de la normale orthogonale à l'axe.
         val d = axis[0] * norm[0] + axis[1] * norm[1] + axis[2] * norm[2]
         norm = normalized(
@@ -775,8 +1154,8 @@ class NativeArView(
         )
 
         // --- Roulis du bracelet contraint par la silhouette MESURÉE ---------
-        // La normale de paume est la mesure la plus bruitée du pipeline (d'où
-        // fNorm à minCutoff 0.35) et surtout elle est mal CONTRAINTE quand la
+        // La normale de paume est la mesure la plus bruitée du pipeline, et
+        // surtout elle est mal CONTRAINTE quand la
         // main est à plat face caméra : les deux bords lm0→lm5 et lm0→lm17
         // sont alors presque colinéaires en projection, leur produit vectoriel
         // part au bruit et le bracelet pivote autour de l'avant-bras.
@@ -804,19 +1183,10 @@ class NativeArView(
                 // Lever l'ambiguïté ±180° de l'axe de largeur : garder le sens
                 // qui met la face avant du bijou (cross(colX, axe)) côté caméra.
                 if (cross(c, axis)[2] < 0f) c = floatArrayOf(-c[0], -c[1], -c[2])
-                val sm = smoothRoll
-                smoothRoll = if (sm == null) {
-                    c
-                } else {
-                    normalized(
-                        floatArrayOf(
-                            sm[0] + kRollLerp * (c[0] - sm[0]),
-                            sm[1] + kRollLerp * (c[1] - sm[1]),
-                            sm[2] + kRollLerp * (c[2] - sm[2]),
-                        ),
-                        fallback = c,
-                    )
-                }
+                // Retenu BRUT : son lissage propre (kRollLerp) était le
+                // troisième retard indépendant de la pose. Il part maintenant
+                // dans la rotation assemblée, lissée d'un bloc par fQuat.
+                smoothRoll = c
             }
         }
 
@@ -824,9 +1194,9 @@ class NativeArView(
         //  - bague : axe du trou = +Z modèle, pierre = +Y → Z→doigt, Y→dos de main ;
         //  - bracelet : axe du trou = +Y modèle → Y→avant-bras, Z→caméra.
         // Le tangage +90° appliqué en V1 est absorbé par ce mapping direct.
-        val colX: FloatArray
-        val colY: FloatArray
-        val colZ: FloatArray
+        var colX: FloatArray
+        var colY: FloatArray
+        var colZ: FloatArray
         val roll = if (anchor == "wrist") smoothRoll else null
         if (anchor == "neck") {
             // norm porte déjà la ligne d'épaules orthogonalisée contre l'axe
@@ -860,6 +1230,58 @@ class NativeArView(
             }
             colX = cross(colY, colZ)
         }
+
+        // --- LISSAGE UNIQUE DE LA POSE --------------------------------------
+        // Tout ce qui précède est BRUT. La base assemblée est une vraie
+        // rotation ; on la lisse ici, d'un seul coup, en passant par le
+        // quaternion — après quoi plus personne ne retouche l'orientation.
+        //
+        // C'est ce qui rend le bijou solidaire : sa translation, sa rotation et
+        // son échelle sortent maintenant du même instant avec le même retard,
+        // comme les composantes d'une transformation rigide unique. C'est la
+        // propriété que Snap obtient en attachant le bijou à un OS d'un mesh de
+        // main riggé ; on l'obtient ici sans mesh, en refusant simplement de
+        // filtrer les morceaux séparément.
+        run {
+            // Réinitialisation demandée par le thread de détection (main
+            // perdue puis retrouvée) : consommée ICI, par le thread qui
+            // possède le filtre. Sans ça, la pose repartirait en rattrapant
+            // lentement une orientation périmée.
+            if (poseResetPending) {
+                poseResetPending = false
+                fQuat.reset()
+            }
+            val q = fQuat.filter(quatFromBasis(colX, colY, colZ), nowMs)
+            val b = basisFromQuat(q)
+            colX = b[0]
+            colY = b[1]
+            colZ = b[2]
+        }
+
+        // Placement AXIAL mesuré : la manchette fait 2×kBandHalfHeight unités
+        // de haut le long du bras (profil GLB mesuré : bande pleine hauteur,
+        // rayon intérieur constant). Centrée sur le poignet, elle
+        // chevaucherait la paume — c'est ce chevauchement qui donnait le
+        // rendu "posé sur la main". On place son bord supérieur au pli du
+        // poignet : centre = poignet + (demi-hauteur + marge) vers le coude.
+        // Collier : même piège que la manchette, en plus marqué — l'ouverture
+        // du plastron est à Y=+0.90 dans le modèle, PAS à son centre. Centrer
+        // la pièce sur le cou la placerait ~1 unité trop haut, l'anneau
+        // au-dessus du menton. On descend donc l'origine du modèle de
+        // 0.90×s sous le creux sternal : l'ouverture y affleure et la pièce
+        // retombe sur la poitrine.
+        //
+        // L'offset suit colY — l'axe du membre APRÈS lissage de la pose — et
+        // non plus l'axe brut. Autrement le décalage de position serait calculé
+        // dans une direction en avance sur l'orientation rendue, ce qui
+        // rouvrirait par la bande la dissociation qu'on vient de fermer.
+        val alongOff = when (anchor) {
+            "wrist" -> s * (bandHalfHeight + kBandGap)
+            "neck" -> s * openingAt
+            else -> 0f
+        }
+        val wx = (aX - 0.5f) * 2f * halfW - colY[0] * alongOff
+        val wy = (0.5f - aY) * 2f * halfH - colY[1] * alongOff
 
         // --- Recentrage du PIVOT sur le centre du TROU ----------------------
         // L'origine d'un GLB Meshy tombe sur le centre de sa boîte englobante,
@@ -896,8 +1318,19 @@ class NativeArView(
                 TAG,
                 "rendu: fov=${Math.toDegrees(fov.toDouble()).toInt()}° " +
                     "halfH=$halfH s=$s handLen=$worldHandLen planar=$planar " +
+                    "unités/m=$unitsPerMeter métriquePlanaire=$metricPlanar " +
+                    "verrou=${if (scaleLocked) "FIGÉ" else "en cours"} " +
+                    "latence=${lastAnchorAgeMs}ms " +
                     "poignetR=$worldWristRadius " +
-                    "(${if (segFresh) "mesuré masque" else "estimé main"}) " +
+                    "(${
+                        when {
+                            lockWristRadius.value > 0f && unitsPerMeter > 0f ->
+                                "verrou ${lockWristRadius.value} m"
+                            segFresh -> "mesuré masque"
+                            else -> "estimé main"
+                        }
+                    }) " +
+                    "doigtVerrou=${lockFingerRadius.value} " +
                     "mesuré=$measuredRadius estimé=$anatomicalRadius " +
                     "rapport=$segRatio " +
                     (if (anchor == "neck") {
@@ -983,9 +1416,13 @@ class NativeArView(
             // s·R·holeCenter, soit la moitié du rayon du doigt pour la bague
             // (holeCenter.y = -0.32) : l'occluseur se retrouvait à moitié hors
             // du membre qu'il est censé représenter.
-            val ox = wx + axis[0] * occRise
-            val oy = wy + axis[1] * occRise
-            val oz = axis[2] * occRise
+            // Remontée le long de l'axe LISSÉ (colY = limbAxis), pas de l'axe
+            // brut : l'occluseur doit être rigidement solidaire de la pièce
+            // qu'il masque. Sur l'axe brut il aurait vibré indépendamment
+            // d'elle, laissant réapparaître le dos du collier par intermittence.
+            val ox = wx + limbAxis[0] * occRise
+            val oy = wy + limbAxis[1] * occRise
+            val oz = limbAxis[2] * occRise
             val om = floatArrayOf(
                 colX[0] * r1, colX[1] * r1, colX[2] * r1, 0f,
                 axisDir[0] * len, axisDir[1] * len, axisDir[2] * len, 0f,
@@ -1110,9 +1547,15 @@ class NativeArView(
                 .setRunningMode(RunningMode.LIVE_STREAM)
                 .setNumPoses(1)
                 // Masque de segmentation personne : sert à mesurer la largeur
-                // RÉELLE de la silhouette du bras (dimensionnement du bracelet
-                // et de l'occluseur sur le bras réel, pas sur une estimation).
-                .setOutputSegmentationMasks(true)
+                // RÉELLE de la silhouette du bras (dimensionnement/centrage de
+                // la manchette). RÉSERVÉ AU BRAS : c'est l'étage le plus cher du
+                // pipeline (le commentaire d'origine mesurait <1 Hz en CPU), et
+                // pour le collier la pose est le SEUL détecteur — la ralentir
+                // avec le masque faisait décrocher tout le suivi (« le cou n'est
+                // jamais détecté »). Le collier n'a de toute façon pas besoin du
+                // masque : sa largeur de cou a un repli anatomique (épaules) et
+                // il ne fait pas de recentrage silhouette. On le coupe pour lui.
+                .setOutputSegmentationMasks(anchor == "wrist")
                 .setResultListener { result, _ -> onPose(result) }
                 .setErrorListener { e -> Log.e(TAG, "Pose error: ${e.message}") }
                 .build()
@@ -1243,7 +1686,15 @@ class NativeArView(
 
         val candRot = candidate(true)
         val candUpright = candidate(false)
-        val useRot = score(candRot) >= score(candUpright)
+        // Décision VERROUILLÉE : la convention de rotation est une propriété du
+        // device, elle ne change pas en cours de session. On n'accepte un
+        // candidat instantané que s'il gagne d'une marge FRANCHE — sinon on
+        // s'abstient (null) et la valeur en cours est conservée.
+        val sRot = score(candRot)
+        val sUp = score(candUpright)
+        val instant: Boolean? =
+            if (abs(sRot - sUp) < kConventionMargin) null else sRot > sUp
+        val useRot = stickyArmRot.update(instant) ?: (sRot >= sUp)
         val chosen = if (useRot) candRot else candUpright
 
         // LONGUEUR MINIMALE. Second filtre, indépendant de la visibilité : si
@@ -1293,9 +1744,14 @@ class NativeArView(
             val el = lm[elbowIdx]
             // La convention d'espace du masque est sondée au point PROCHE
             // (toujours sur le bras si la détection est bonne).
-            val rawMode = scanner.probeRawMode(
-                wl.x() + (el.x() - wl.x()) * kScanNear,
-                wl.y() + (el.y() - wl.y()) * kScanNear,
+            // Verrouillée aussi : l'espace du masque est une propriété du
+            // pipeline. Une sonde qui tombe hors du masque renvoie null et
+            // laisse la valeur en place au lieu de la remettre en cause.
+            val rawMode = stickyArmMask.update(
+                scanner.probeRawMode(
+                    wl.x() + (el.x() - wl.x()) * kScanNear,
+                    wl.y() + (el.y() - wl.y()) * kScanNear,
+                ),
             )
 
             /** Pleine largeur de la silhouette à [frac] le long de
@@ -1322,7 +1778,29 @@ class NativeArView(
                 return if (w in kSegMinWidthN..kSegMaxWidthN) v else null
             }
 
-            val near = measureAt(kScanNear)
+            // POIGNET = point le plus ÉTROIT du bras entre la main et le milieu
+            // de l'avant-bras. On balaye plusieurs positions et on garde la
+            // largeur MINIMALE, au lieu d'un unique point à kScanNear qui, quand
+            // la main s'ouvre, tombait sur la paume (large) et faisait échouer
+            // toute la mesure — donc l'effondrement de taille. Un échantillon
+            // sur la paume donne une largeur plus grande : le minimum l'écarte
+            // de lui-même. Ce minimum localise aussi le pli du poignet.
+            var near: FloatArray? = null
+            var nearW = Float.MAX_VALUE
+            run {
+                var f = kWristScanFrom
+                while (f <= kWristScanTo) {
+                    val m = measureAt(f)
+                    if (m != null) {
+                        val w = hypot(m[2], m[3])
+                        if (w < nearW) {
+                            nearW = w
+                            near = m
+                        }
+                    }
+                    f += kWristScanStep
+                }
+            }
             if (near != null) {
                 wristSeg = near
                 // La mesure lointaine sert au seul évasement : elle peut
@@ -1372,13 +1850,45 @@ class NativeArView(
         val lms = result.landmarks()
         if (lms.isEmpty()) {
             hasHand = false
+            // Cf. onHands : pas de pose ≠ pas d'image.
+            publishFrame(result.timestampMs())
             return
         }
         val lm = lms[0]
         if (lm.size < 13) {
             hasHand = false
+            publishFrame(result.timestampMs())
             return
         }
+
+        // VISIBILITÉ des épaules. Comme pour le bras (cf. onPose), le modèle de
+        // pose renvoie TOUJOURS 33 landmarks, y compris ceux qu'il invente hors
+        // cadre — et une épaule inventée fait basculer la ligne d'épaules, donc
+        // colX ET l'ancre du collier, d'un coup. On lit la confiance publiée par
+        // le détecteur plutôt que de la deviner : sous le seuil, on CONSERVE la
+        // dernière pose (le collier ne saute pas) et on se contente de faire
+        // avancer l'image. C'est l'une des sources du « bouge dans tous les
+        // sens » : des frames à épaules devinées passaient telles quelles.
+        // Seuil VOLONTAIREMENT BAS (kNeckMinVisibility, pas kPoseMinVisibility
+        // du bras) : le collier n'a aucun détecteur de secours, donc rejeter
+        // une frame = figer le bijou. En selfie collier les épaules frôlent
+        // souvent le bord du cadre (visibilité ~0.5) sans être fausses pour
+        // autant. On ne rejette donc QUE les épaules franchement inventées
+        // (confiance quasi nulle) ; le reste, le lissage renforcé l'absorbe.
+        val vshL = lm[11].visibility().orElse(1f)
+        val vshR = lm[12].visibility().orElse(1f)
+        if (vshL < kNeckMinVisibility || vshR < kNeckMinVisibility) {
+            if (poseLogCount % 15 == 0) {
+                Log.i(
+                    TAG,
+                    "cou rejeté: visibilité épaules g=$vshL d=$vshR " +
+                        "(seuil $kNeckMinVisibility)",
+                )
+            }
+            publishFrame(result.timestampMs())
+            return
+        }
+
         val now = SystemClock.uptimeMillis()
         if (now - lastHandMs > kResetAfterMs) resetFilters()
         lastHandMs = now
@@ -1448,8 +1958,18 @@ class NativeArView(
         val upScrStraight = neckUpScr(false)
         val upRot = toWorldDir(upScrRot)
         val upStraight = toWorldDir(upScrStraight)
-        val useRot = normalized(upRot, floatArrayOf(0f, 0f, 0f))[1] >=
-            normalized(upStraight, floatArrayOf(0f, 0f, 0f))[1]
+        // Verrouillée, comme pour le bras : on ne tranche que si l'un des deux
+        // candidats pointe franchement plus « vers le haut » que l'autre.
+        val upScoreRot = normalized(upRot, floatArrayOf(0f, 0f, 0f))[1]
+        val upScoreStraight = normalized(upStraight, floatArrayOf(0f, 0f, 0f))[1]
+        val neckInstant: Boolean? =
+            if (abs(upScoreRot - upScoreStraight) < kConventionMargin) {
+                null
+            } else {
+                upScoreRot > upScoreStraight
+            }
+        val useRot = stickyNeckRot.update(neckInstant)
+            ?: (upScoreRot >= upScoreStraight)
         val upScr = if (useRot) upScrRot else upScrStraight
 
         val shL = toScr(lm[11].x(), lm[11].y(), useRot)
@@ -1473,8 +1993,9 @@ class NativeArView(
             val ey = (lm[7].y() + lm[8].y()) * 0.5f
             val dx = ex - sx
             val dy = ey - sy
-            val rawMode =
-                scanner.probeRawMode(sx + dx * kNeckScanFrom, sy + dy * kNeckScanFrom)
+            val rawMode = stickyNeckMask.update(
+                scanner.probeRawMode(sx + dx * kNeckScanFrom, sy + dy * kNeckScanFrom),
+            )
             var best: FloatArray? = null
             var bestW = Float.MAX_VALUE
             if (rawMode != null) {
@@ -1524,6 +2045,16 @@ class NativeArView(
         val wls = result.worldLandmarks()
         if (wls.isNotEmpty() && wls[0].size > 12) {
             val w = wls[0]
+            // Référence métrique du collier : la LIGNE D'ÉPAULES joue ici le
+            // rôle que lm0→lm9 joue pour la main (cf. metricPlanar).
+            val mp = hypot(w[11].x() - w[12].x(), w[11].y() - w[12].y())
+            if (mp > 1e-5f) metricPlanar = mp
+            val m3 = sqrt(
+                (w[11].x() - w[12].x()) * (w[11].x() - w[12].x()) +
+                    (w[11].y() - w[12].y()) * (w[11].y() - w[12].y()) +
+                    (w[11].z() - w[12].z()) * (w[11].z() - w[12].z()),
+            )
+            if (m3 > 1e-5f) metric3D = m3
             val wdz = (w[7].z() + w[8].z()) * 0.5f -
                 (w[11].z() + w[12].z()) * 0.5f
             val wPlanar = hypot(
@@ -1571,40 +2102,72 @@ class NativeArView(
         // réglé à l'œil sur ce comportement inversé, sa valeur est à revoir
         // visuellement maintenant qu'elle agit dans le sens annoncé.
         val shoulderW = hypot(shR[0] - shL[0], shR[1] - shL[1])
-        val upScrLen = hypot(upScr[0], upScr[1])
-        val riseX = if (upScrLen > 1e-4f) upScr[0] / upScrLen else 0f
-        val riseY = if (upScrLen > 1e-4f) upScr[1] / upScrLen else -1f
-        val ax = (shMidX + riseX * kNeckRise * shoulderW).coerceIn(0f, 1f)
-        val ay = (shMidY + riseY * kNeckRise * shoulderW).coerceIn(0f, 1f)
+        val upScrLen = hypot(upScr[0], upScr[1]).coerceAtLeast(1e-4f)
+        val riseX = upScr[0] / upScrLen
+        val riseY = upScr[1] / upScrLen
+
+        // Repères VISAGE en écran (bouche lm9/10, milieu des oreilles = milieu
+        // des épaules + upScr). Le visage est TOUJOURS cadré pour un essayage
+        // collier, contrairement aux épaules.
+        val mthL = toScr(lm[9].x(), lm[9].y(), useRot)
+        val mthR = toScr(lm[10].x(), lm[10].y(), useRot)
+        val mouthX = (mthL[0] + mthR[0]) * 0.5f
+        val mouthY = (mthL[1] + mthR[1]) * 0.5f
+        val earMidX = shMidX + upScr[0]
+        val earMidY = shMidY + upScr[1]
+        // Longueur de demi-visage (oreilles→bouche) : l'unité d'échelle du
+        // visage à l'écran, robuste à la distance et au cadrage.
+        val faceLen = hypot(mouthX - earMidX, mouthY - earMidY).coerceAtLeast(1e-4f)
+        val faceDownX = (mouthX - earMidX) / faceLen
+        val faceDownY = (mouthY - earMidY) / faceLen
+
+        // VALIDATION anatomique des épaules : une épaule réelle est TOUJOURS
+        // nettement sous la bouche (y écran plus grand). Sinon, la pose les a
+        // inventées trop haut (cadrage serré) → l'ancre milieu-épaules remontait
+        // au visage et le collier se posait sur la bouche. Dans ce cas on dérive
+        // l'ancre du visage : on descend sous le menton le long de l'axe du
+        // visage jusqu'à la base du cou.
+        val shouldersOk = shMidY > mouthY + kNeckShoulderGap * faceLen
+        val ax: Float
+        val ay: Float
+        if (shouldersOk) {
+            // Cas nominal : le milieu des épaules EST la base du cou (le creux
+            // sternal est juste au-dessus → petite montée kNeckRise vers la tête).
+            ax = (shMidX + riseX * kNeckRise * shoulderW).coerceIn(0f, 1f)
+            ay = (shMidY + riseY * kNeckRise * shoulderW).coerceIn(0f, 1f)
+        } else {
+            // Repli VISAGE : base du cou ≈ kFaceToNeck demi-visages sous la
+            // bouche, dans la direction du visage (robuste à l'inclinaison).
+            ax = (mouthX + faceDownX * kFaceToNeck * faceLen).coerceIn(0f, 1f)
+            ay = (mouthY + faceDownY * kFaceToNeck * faceLen).coerceIn(0f, 1f)
+        }
 
         val px = fX.filter(ax, now)
         val py = fY.filter(ay, now)
-        smX = (px + (fX.velocity * kLeadSeconds).coerceIn(-kMaxLead, kMaxLead))
-            .coerceIn(0f, 1f)
-        smY = (py + (fY.velocity * kLeadSeconds).coerceIn(-kMaxLead, kMaxLead))
-            .coerceIn(0f, 1f)
+        smX = px
+        smY = py
+        track = TrackSnapshot(px, py, fX.velocity, fY.velocity, result.timestampMs())
 
-        axisVec = floatArrayOf(
-            fAxis[0].filter(up[0], now),
-            fAxis[1].filter(up[1], now),
-            fAxis[2].filter(up[2], now),
-        )
-        normVec = floatArrayOf(
-            fNorm[0].filter(side[0], now),
-            fNorm[1].filter(side[1], now),
-            fNorm[2].filter(side[2], now),
-        )
+        // Bruts, comme pour la main : un seul lissage, sur la rotation
+        // assemblée (cf. fQuat).
+        axisVec = up
+        normVec = side
         // Réutilise le canal "taille de main" pour la largeur d'épaules :
         // c'est la grandeur d'échelle de repli du collier.
         handDX = fHandDX.filter(shR[0] - shL[0], now)
         handDY = fHandDY.filter(shR[1] - shL[1], now)
         hasHand = true
+        // Collier : c'est la pose qui porte tout le suivi, donc c'est elle qui
+        // libère l'image de sa frame.
+        publishFrame(result.timestampMs())
 
         if (poseLogCount++ % 15 == 0) {
             Log.i(
                 TAG,
                 "cou: conv=${if (useRot) "rot" else "droit"} " +
-                    "ancre=($smX, $smY) épaules=$shoulderW " +
+                    "ancre=($smX, $smY) source=${if (shouldersOk) "ÉPAULES" else "VISAGE"} " +
+                    "épMidY=$shMidY boucheY=$mouthY demiVisage=$faceLen " +
+                    "épaules=$shoulderW " +
                     "haut=(${axisVec[0]}, ${axisVec[1]}, ${axisVec[2]}) " +
                     "côté=(${normVec[0]}, ${normVec[1]}, ${normVec[2]})",
             )
@@ -1615,6 +2178,11 @@ class NativeArView(
         val hands = result.landmarks()
         if (hands.isEmpty() || hands[0].size < 21) {
             hasHand = false
+            // L'image doit continuer de défiler même sans main : sinon
+            // l'utilisateur qui n'a pas encore cadré sa main verrait un écran
+            // NOIR et croirait l'app cassée. C'est le bijou qui disparaît
+            // faute de détection, pas la caméra.
+            publishFrame(result.timestampMs())
             return
         }
         val lm = hands[0]
@@ -1694,14 +2262,38 @@ class NativeArView(
             ry = p13[1] + (p14[1] - p13[1]) * kRingAlongPhalanx
         }
 
-        val px = fX.filter(rx.coerceIn(0f, 1f), now)
-        val py = fY.filter(ry.coerceIn(0f, 1f), now)
-        // Extrapolation : position filtrée + vitesse lissée × avance, bornée
-        // (compense la latence détection async + rendu, cf. version Dart).
-        smX = (px + (fX.velocity * kLeadSeconds).coerceIn(-kMaxLead, kMaxLead))
-            .coerceIn(0f, 1f)
-        smY = (py + (fY.velocity * kLeadSeconds).coerceIn(-kMaxLead, kMaxLead))
-            .coerceIn(0f, 1f)
+        // Ancre en pixels IMAGE (repère du bitmap), pour le flux optique.
+        val anchorImgX: Float
+        val anchorImgY: Float
+        if (anchor == "wrist") {
+            anchorImgX = lm[0].x() * frameW
+            anchorImgY = lm[0].y() * frameH
+        } else {
+            anchorImgX = (lm[13].x() + (lm[14].x() - lm[13].x()) * kRingAlongPhalanx) * frameW
+            anchorImgY = (lm[13].y() + (lm[14].y() - lm[13].y()) * kRingAlongPhalanx) * frameH
+        }
+
+        // Le flux optique, quand il a quelque chose à dire, REMPLACE le
+        // passe-bas : il calme le bruit par une mesure indépendante au lieu
+        // d'une moyenne temporelle, donc sans le retard qui va avec. Les
+        // filtres One-Euro continuent de tourner en parallèle — ils restent le
+        // repli, et leur vitesse sert toujours à l'extrapolation.
+        val fused = fuseWithFlow(
+            rx.coerceIn(0f, 1f), ry.coerceIn(0f, 1f),
+            anchorImgX, anchorImgY, result.timestampMs(),
+        )
+        val lpX = fX.filter(rx.coerceIn(0f, 1f), now)
+        val lpY = fY.filter(ry.coerceIn(0f, 1f), now)
+        val px = fused?.get(0) ?: lpX
+        val py = fused?.get(1) ?: lpY
+        smX = px
+        smY = py
+        // L'extrapolation n'a plus lieu ICI mais dans la boucle de rendu :
+        // on publie l'état daté + la vitesse, le rendu l'avance jusqu'à SA
+        // date (cf. TrackSnapshot et anchorAt).
+        track = TrackSnapshot(px, py, fX.velocity, fY.velocity, result.timestampMs())
+        // La pose de CETTE frame est posée : son image peut être montrée.
+        publishFrame(result.timestampMs())
 
         // --- Orientation 6DoF depuis les landmarks MONDE -------------------
         // Les world landmarks sont métriques (mètres, modèle 3D de main
@@ -1731,20 +2323,45 @@ class NativeArView(
                 // seuil qui ne mesurait pas l'angle qu'il croyait mesurer.
                 val handAxis = worldDelta(w[9], w[0])
                 val pa = poseAxis
-                if (pa != null && now - poseAxisMs < kPoseFreshMs) {
-                    val pn = normalized(pa, fallback = handAxis)
+                // Ce choix-ci est le plus dangereux du pipeline : l'ancien
+                // seuil unique acceptait la pose jusqu'à 60° de l'axe main,
+                // donc chaque bascule faisait pivoter le bijou d'un bloc. Avec
+                // un seuil UNIQUE, une cohérence qui flotte autour de la limite
+                // fait osciller la source à la fréquence du bruit.
+                //
+                // DÉCLENCHEUR DE SCHMITT : on n'ADOPTE la pose que sur une
+                // cohérence franche (~25°), on ne l'ABANDONNE qu'une fois
+                // nettement dégradée (~45°). Entre les deux, on garde la source
+                // en cours. Le vote par-dessus interdit toute bascule sur une
+                // frame isolée.
+                val fresh = pa != null && now - poseAxisMs < kPoseFreshMs
+                val dot = if (fresh) {
+                    val pn = normalized(pa!!, fallback = handAxis)
                     val hn = normalized(handAxis, fallback = pn)
-                    val dot = pn[0] * hn[0] + pn[1] * hn[1] + pn[2] * hn[2]
-                    if (dot >= kPoseCoherenceDot) {
-                        axisRaw = pa
-                        lastAxisSource = "pose"
-                    } else {
-                        axisRaw = handAxis
-                        lastAxisSource = "main(pose rejetée dot=$dot)"
-                    }
+                    pn[0] * hn[0] + pn[1] * hn[1] + pn[2] * hn[2]
+                } else {
+                    -1f
+                }
+                val want = when {
+                    !fresh -> false
+                    dot >= kPoseEnterDot -> true
+                    dot < kPoseExitDot -> false
+                    else -> usePoseAxis
+                }
+                if (want == usePoseAxis) {
+                    poseSourceVotes = 0
+                } else if (++poseSourceVotes >= kSourceVotesToFlip) {
+                    usePoseAxis = want
+                    poseSourceVotes = 0
+                    Log.i(TAG, "source de l'axe → ${if (want) "pose" else "main"} (dot=$dot)")
+                }
+                if (usePoseAxis && pa != null) {
+                    axisRaw = pa
+                    lastAxisSource = "pose(dot=$dot)"
                 } else {
                     axisRaw = handAxis
-                    lastAxisSource = "main(pose absente)"
+                    lastAxisSource =
+                        if (fresh) "main(dot=$dot)" else "main(pose absente)"
                 }
             } else {
                 // Axe du trou de la bague = direction du doigt (base→phalange).
@@ -1784,6 +2401,7 @@ class NativeArView(
                 return sqrt(dx * dx + dy * dy + dz * dz)
             }
             val handLen3 = metricDist(w[9], w[0])
+            if (handLen3 > 1e-5f) metric3D = handLen3
             if (handLen3 > 1e-5f) {
                 val pitch =
                     0.5f * (metricDist(w[13], w[9]) + metricDist(w[17], w[13]))
@@ -1792,22 +2410,27 @@ class NativeArView(
                 // repliée, doigts fusionnés) : on garde la valeur précédente.
                 if (raw in kFingerPitchMin..kFingerPitchMax) {
                     fingerPitchRatio = fPitch.filter(raw, now)
+                    // Rayon du doigt en MÈTRES, publié brut : c'est la médiane
+                    // du verrou qui le stabilise. Un passe-bas de plus ne
+                    // ferait que retarder une grandeur qui, une fois
+                    // verrouillée, ne bouge plus du tout.
+                    fingerRadiusMetric = 0.5f * pitch
                 }
             }
 
-            // Normalisation avant filtrage : composantes d'amplitude stable,
-            // indépendantes de la taille de main.
-            val axisN = normalized(axisRaw, fallback = axisVec)
-            axisVec = floatArrayOf(
-                fAxis[0].filter(axisN[0], now),
-                fAxis[1].filter(axisN[1], now),
-                fAxis[2].filter(axisN[2], now),
-            )
-            normVec = floatArrayOf(
-                fNorm[0].filter(normN[0], now),
-                fNorm[1].filter(normN[1], now),
-                fNorm[2].filter(normN[2], now),
-            )
+            // Longueur planaire métrique de référence (cf. metricPlanar). La
+            // magnitude en x,y est invariante à la rotation d'image appliquée
+            // par displayVec (rotations de 90° + miroir), donc lisible
+            // directement sur les world landmarks sans conversion.
+            val mp = hypot(w[9].x() - w[0].x(), w[9].y() - w[0].y())
+            if (mp > 1e-5f) metricPlanar = mp
+
+            // Publiés BRUTS : le lissage a lieu une seule fois, sur la rotation
+            // assemblée (cf. fQuat). Filtrer ici ferait exactement ce qu'on
+            // cherche à supprimer — deux directions lissées séparément, donc
+            // deux retards différents dans une même pose.
+            axisVec = normalized(axisRaw, fallback = axisVec)
+            normVec = normN
         }
 
         // Taille apparente de la main (poignet→base du majeur), en écran.
@@ -1827,19 +2450,262 @@ class NativeArView(
         }
     }
 
+    // --- Affichage LOCKSTEP -------------------------------------------------
+
+    /** Frames analysées en attente de leur résultat de détection. Un anneau
+     *  suffit : MediaPipe en LIVE_STREAM jette les frames quand il est occupé,
+     *  donc certaines n'auront jamais de résultat et doivent simplement être
+     *  écrasées. Écrit par le thread d'analyse, lu par celui de détection. */
+    // --- Fusion flux optique (cf. FlowTracker) ------------------------------
+
+    private val flowTracker = FlowTracker(kFlowWin, kFlowWin / 2)
+
+    /** Ancre fusionnée de la frame précédente (écran normalisé), position
+     *  brute correspondante, et horodatage — le tout en repère de détection. */
+    private var flowAnchorX = -1f
+    private var flowAnchorY = -1f
+    private var flowPrevTs = -1L
+    private var flowHit = 0L
+    private var flowMiss = 0L
+
+    /**
+     * Fusionne la mesure brute du réseau avec le déplacement mesuré par flux
+     * optique, et renvoie l'ancre à utiliser (écran normalisé).
+     *
+     * Le filtre est complémentaire : on PRÉDIT par le flux — précis à court
+     * terme, sans retard — puis on CORRIGE faiblement vers la mesure du réseau
+     * — bruitée mais sans dérive. Le résultat suit le mouvement réel
+     * immédiatement tout en restant ancré sur l'anatomie détectée.
+     *
+     * C'est ce qui remplace le passe-bas : là où le One-Euro n'avait d'autre
+     * moyen de calmer le bruit que de retarder le signal, ici le bruit est
+     * écarté par une mesure INDÉPENDANTE, pas par une moyenne temporelle.
+     *
+     * Renvoie null quand le flux n'a rien d'exploitable — l'appelant retombe
+     * alors sur le comportement One-Euro, jamais pire qu'avant.
+     */
+    private fun fuseWithFlow(
+        rawX: Float,
+        rawY: Float,
+        imgX: Float,
+        imgY: Float,
+        ts: Long,
+    ): FloatArray? {
+        if (!flowEnabled) return null
+        val bmp = frameFor(ts) ?: return null
+
+        // L'amorce est calculée par le tracker lui-même, à partir des deux
+        // ancres successives en pixels IMAGE (cf. track).
+        val ok = flowAnchorX >= 0f && flowPrevTs >= 0L
+        val d = flowTracker.track(bmp, ts, imgX, imgY, flowPrevTs)
+        flowPrevTs = ts
+
+        if (d == null || !ok) {
+            flowMiss++
+            // Réamorçage : la prochaine frame repartira de la mesure réseau.
+            flowAnchorX = rawX
+            flowAnchorY = rawY
+            return null
+        }
+        flowHit++
+
+        // Déplacement image → écran normalisé, via la conversion PROUVÉE : le
+        // flux vit en pixels capteur, l'ancre en espace d'affichage, et les
+        // deux ne diffèrent pas que d'un facteur d'échelle (rotation, miroir,
+        // recadrage). Convertir deux points et prendre leur écart est le seul
+        // moyen sûr de ne pas réintroduire une convention à la main.
+        val p0 = sensorToDisplay(imgX / frameW, imgY / frameH)
+        val p1 = sensorToDisplay((imgX + d[0]) / frameW, (imgY + d[1]) / frameH)
+
+        val predX = flowAnchorX + (p1[0] - p0[0])
+        val predY = flowAnchorY + (p1[1] - p0[1])
+        val fx = (predX + kFlowCorrect * (rawX - predX)).coerceIn(0f, 1f)
+        val fy = (predY + kFlowCorrect * (rawY - predY)).coerceIn(0f, 1f)
+        flowAnchorX = fx
+        flowAnchorY = fy
+
+        if ((flowHit + flowMiss) % 90 == 0L) {
+            Log.i(
+                TAG,
+                "flux: suivies=$flowHit perdues=$flowMiss " +
+                    "déplacement=(${d[0]}, ${d[1]}) px " +
+                    "écartRéseau=(${rawX - fx}, ${rawY - fy})",
+            )
+        }
+        return floatArrayOf(fx, fy)
+    }
+
+    /** Compteurs de l'affichage lockstep (threads de détection uniquement). */
+    private var frameHit = 0L
+    private var frameMiss = 0L
+
+    private val frameLock = Any()
+    private val frameTs = LongArray(kFrameRing)
+    private val frameBmp = arrayOfNulls<Bitmap>(kFrameRing)
+    private var frameIdx = 0
+
+    private fun storeFrame(ts: Long, bmp: Bitmap) {
+        synchronized(frameLock) {
+            frameTs[frameIdx] = ts
+            frameBmp[frameIdx] = bmp
+            frameIdx = (frameIdx + 1) % kFrameRing
+        }
+    }
+
+    /** Frame correspondant EXACTEMENT à [ts], ou null si elle a déjà été
+     *  écrasée (détection trop lente : on garde alors l'image précédente
+     *  plutôt que d'en afficher une désynchronisée). */
+    private fun frameFor(ts: Long): Bitmap? = synchronized(frameLock) {
+        for (i in frameBmp.indices) if (frameTs[i] == ts) return@synchronized frameBmp[i]
+        null
+    }
+
+    /** Publie la frame dont la détection vient d'aboutir. Appelé depuis les
+     *  callbacks de détection, juste après l'écriture de la pose : image et
+     *  pose deviennent visibles ensemble. */
+    private fun publishFrame(ts: Long) {
+        if (!lockstep) return
+        val bmp = frameFor(ts)
+        if (bmp == null) {
+            // La frame a été écrasée avant que sa détection n'aboutisse : on
+            // garde l'image précédente plutôt que d'en afficher une
+            // désynchronisée. Compté, parce qu'un taux élevé signifie que
+            // kFrameRing est trop court pour la latence réelle du device —
+            // diagnostic impossible à poser autrement.
+            frameMiss++
+            return
+        }
+        frameHit++
+        shownFrame = bmp
+        frameView?.postInvalidateOnAnimation()
+        if ((frameHit + frameMiss) % 90 == 0L) {
+            Log.i(
+                TAG,
+                "lockstep: frames affichées=$frameHit manquées=$frameMiss " +
+                    "(anneau=$kFrameRing, ${frameW}x$frameH)",
+            )
+        }
+    }
+
+    /** Matrice image→écran, construite en faisant passer TROIS COINS de
+     *  l'image par [sensorToDisplay] — la conversion utilisée par le suivi.
+     *
+     *  Trois points définissent exactement une affine, et les prendre de cette
+     *  façon rend la géométrie de l'affichage IDENTIQUE PAR CONSTRUCTION à
+     *  celle des landmarks : rotation, recadrage et miroir ne peuvent plus
+     *  diverger entre ce qu'on montre et ce qu'on suit. Redériver ces
+     *  formules à la main aurait rouvert toute la famille de bugs
+     *  « image à l'envers / en miroir » que la chaîne toScreen a déjà payés.
+     *
+     *  C'est aussi un gain de justesse : le chemin historique SUPPOSE que le
+     *  recadrage FILL_CENTER de PreviewView coïncide avec les facteurs cx/cy
+     *  calculés ici. Ici on ne le suppose plus, on l'impose. */
+    private fun buildFrameMatrix(bmp: Bitmap, viewW: Int, viewH: Int): Boolean {
+        if (viewW <= 0 || viewH <= 0 || frameW <= 0 || frameH <= 0) return false
+        val bw = bmp.width.toFloat()
+        val bh = bmp.height.toFloat()
+        if (bw <= 0f || bh <= 0f) return false
+        val src = floatArrayOf(0f, 0f, bw, 0f, 0f, bh)
+        val unit = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
+        val dst = FloatArray(6)
+        for (i in 0 until 3) {
+            val p = sensorToDisplay(unit[i * 2], unit[i * 2 + 1])
+            dst[i * 2] = p[0] * viewW
+            dst[i * 2 + 1] = p[1] * viewH
+        }
+        frameMatrix.reset()
+        return frameMatrix.setPolyToPoly(src, 0, dst, 0, 3)
+    }
+
+    /** Point normalisé de l'espace CAPTEUR vers l'espace d'AFFICHAGE :
+     *  rotation, recadrage centré, miroir frontal. Extrait de `toScreen` afin
+     *  que suivi et affichage partagent une seule et même convention. */
+    private fun sensorToDisplay(x: Float, y: Float): FloatArray {
+        val rot = frameRotation
+        val ux: Float
+        val uy: Float
+        when (rot) {
+            90 -> { ux = 1f - y; uy = x }
+            180 -> { ux = 1f - x; uy = 1f - y }
+            270 -> { ux = y; uy = 1f - x }
+            else -> { ux = x; uy = y }
+        }
+        val uprightW = if (rot == 90 || rot == 270) frameH else frameW
+        val uprightH = if (rot == 90 || rot == 270) frameW else frameH
+        var cx = 1f
+        var cy = 1f
+        if (uprightW > 0 && uprightH > 0 && root.width > 0 && root.height > 0) {
+            val imgAspect = uprightW.toFloat() / uprightH
+            val viewAspect = root.width.toFloat() / root.height
+            if (imgAspect > viewAspect) cx = imgAspect / viewAspect
+            else cy = viewAspect / imgAspect
+        }
+        return floatArrayOf(
+            1f - (0.5f + (ux - 0.5f) * cx),
+            0.5f + (uy - 0.5f) * cy,
+        )
+    }
+
+    /** Ancre extrapolée à MAINTENANT, en espace écran normalisé.
+     *
+     *  Deux problèmes distincts sont réglés ici, et c'est le même calcul qui
+     *  les règle tous les deux :
+     *
+     *  1. LE PAS D'ESCALIER. La détection tourne à 15-30 Hz, la boucle de rendu
+     *     à 60 fps. L'ancre n'étant recalculée qu'à la détection, elle restait
+     *     FIGÉE pendant deux à quatre frames de rendu puis sautait — un
+     *     déplacement en escalier, alors que la vidéo dessous avance
+     *     continûment. Extrapoler à la date du RENDU redonne un mouvement lisse
+     *     à 60 fps.
+     *
+     *  2. LA LATENCE. L'aperçu caméra s'affiche sans délai, alors que le bijou
+     *     décrit une frame vieille de 60 à 150 ms : c'est ce décalage qui fait
+     *     « glisser » le bijou dès que la main bouge. L'âge de l'instantané EST
+     *     ce délai, mesuré directement — plus besoin de l'estimer par une
+     *     constante réglée à la main, qui était forcément fausse dès que le
+     *     pipeline changeait de vitesse (passage de la pose sur GPU, device
+     *     plus lent, charge thermique).
+     *
+     *  L'extrapolation échange du retard contre de la gigue, la vitesse étant
+     *  la sortie la plus bruitée d'un One-Euro : l'âge et le déplacement sont
+     *  donc tous deux bornés. Sans instantané (aucune détection encore), on
+     *  retombe sur la dernière ancre filtrée. */
+    private fun anchorAt(nowMs: Long): FloatArray {
+        val s = track ?: return floatArrayOf(smX, smY)
+        val age = ((nowMs - s.frameTimeMs).toFloat() / 1000f)
+            .coerceIn(0f, kMaxLatencySec)
+        lastAnchorAgeMs = age * 1000f
+        return floatArrayOf(
+            (s.x + (s.vx * age).coerceIn(-kMaxLead, kMaxLead)).coerceIn(0f, 1f),
+            (s.y + (s.vy * age).coerceIn(-kMaxLead, kMaxLead)).coerceIn(0f, 1f),
+        )
+    }
+
     private fun resetFilters() {
         fX.reset()
         fY.reset()
         fHandDX.reset()
         fHandDY.reset()
-        fAxis.forEach { it.reset() }
-        fNorm.forEach { it.reset() }
+        // PAS fQuat.reset() ici : resetFilters s'exécute sur le thread de
+        // DÉTECTION, alors que fQuat est filtré par la boucle de RENDU. Toucher
+        // son état interne d'ici serait une course — sans crash, mais avec des
+        // à-coups d'orientation impossibles à reproduire. On signale la demande,
+        // le thread propriétaire l'exécute.
+        poseResetPending = true
         // Le filtre repart de zéro, mais PAS fingerPitchRatio : c'est une
         // constante morphologique, la bague ne doit pas changer de taille
         // parce que la main est sortie du champ une seconde.
         fPitch.reset()
         // Le signe de la normale se réinitialisera "face caméra".
         prevNormal = null
+        // Instantané périmé : sans ça, la reprise extrapolerait depuis une
+        // vitesse vieille de plusieurs centaines de millisecondes.
+        track = null
+        // Le flux relie deux frames CONSÉCUTIVES : après une coupure, la
+        // précédente n'a plus rien à voir avec la suivante.
+        flowTracker.reset()
+        flowAnchorX = -1f
+        flowPrevTs = -1L
     }
 
     // --- petites aides vectorielles ----------------------------------------
@@ -1860,6 +2726,67 @@ class NativeArView(
         val w = root.width
         val h = root.height
         return if (w > 0 && h > 0) w.toFloat() / h.toFloat() else 1f
+    }
+
+    /** Quaternion (x, y, z, w) d'une base orthonormée donnée par ses COLONNES.
+     *
+     *  Méthode de Shepperd : on extrait la composante la plus grande d'abord.
+     *  La formule directe par la trace perd toute précision quand celle-ci
+     *  approche −1 (rotation de ~180°, ici un poignet retourné), au point de
+     *  produire un quaternion non unitaire — donc une base cisaillée. */
+    private fun quatFromBasis(
+        cx: FloatArray,
+        cy: FloatArray,
+        cz: FloatArray,
+    ): FloatArray {
+        val m00 = cx[0]; val m10 = cx[1]; val m20 = cx[2]
+        val m01 = cy[0]; val m11 = cy[1]; val m21 = cy[2]
+        val m02 = cz[0]; val m12 = cz[1]; val m22 = cz[2]
+        val tr = m00 + m11 + m22
+        return when {
+            tr > 0f -> {
+                val s = sqrt(tr + 1f) * 2f
+                floatArrayOf(
+                    (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s,
+                )
+            }
+            m00 > m11 && m00 > m22 -> {
+                val s = sqrt(1f + m00 - m11 - m22) * 2f
+                floatArrayOf(
+                    0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s,
+                )
+            }
+            m11 > m22 -> {
+                val s = sqrt(1f + m11 - m00 - m22) * 2f
+                floatArrayOf(
+                    (m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s,
+                )
+            }
+            else -> {
+                val s = sqrt(1f + m22 - m00 - m11) * 2f
+                floatArrayOf(
+                    (m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s,
+                )
+            }
+        }
+    }
+
+    /** Colonnes de la base orthonormée d'un quaternion (x, y, z, w).
+     *  Orthonormée par construction : c'est ce qui garantit qu'aucune étape du
+     *  lissage ne peut déformer le bijou. */
+    private fun basisFromQuat(q: FloatArray): Array<FloatArray> {
+        val x = q[0]; val y = q[1]; val z = q[2]; val w = q[3]
+        return arrayOf(
+            floatArrayOf(
+                1f - 2f * (y * y + z * z), 2f * (x * y + w * z), 2f * (x * z - w * y),
+            ),
+            floatArrayOf(
+                2f * (x * y - w * z), 1f - 2f * (x * x + z * z), 2f * (y * z + w * x),
+            ),
+            floatArrayOf(
+                2f * (x * z + w * y), 2f * (y * z - w * x), 1f - 2f * (x * x + y * y),
+            ),
+        )
     }
 
     private fun cross(a: FloatArray, b: FloatArray): FloatArray = floatArrayOf(
@@ -1896,15 +2823,48 @@ class NativeArView(
                 // d'ANALYSE et appliqué à ce qu'affiche la PREVIEW — l'erreur
                 // serait nulle au centre de l'écran et croissante vers les
                 // bords, un décalage très pénible à diagnostiquer à l'œil.
-                val resolution = ResolutionSelector.Builder()
+                val resBuilder = ResolutionSelector.Builder()
                     .setAspectRatioStrategy(
                         AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY,
                     )
-                    .build()
-                val preview = Preview.Builder()
-                    .setResolutionSelector(resolution)
-                    .build()
-                    .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                if (lockstep) {
+                    // En lockstep, la frame d'ANALYSE est aussi la frame
+                    // AFFICHÉE : sa résolution devient donc celle de l'image
+                    // que voit l'utilisateur. Au défaut (~640×480), le portrait
+                    // n'offre que 480 px de large étirés sur une dalle de
+                    // 1080 — 2,25× d'agrandissement, franchement mou. En
+                    // 1280×960 l'agrandissement tombe à ~1,12×, quasi
+                    // imperceptible.
+                    //
+                    // Le surcoût est modeste là où on pourrait le craindre :
+                    // MediaPipe redimensionne en interne vers l'entrée fixe de
+                    // son modèle, donc l'INFÉRENCE ne dépend pas de la taille
+                    // fournie. Ne montent que la conversion en bitmap et le
+                    // transfert GPU.
+                    //
+                    // Appliqué UNIQUEMENT en lockstep : l'interrupteur éteint
+                    // doit rendre un pipeline rigoureusement identique à celui
+                    // d'avant, sans quoi comparer les deux modes ne voudrait
+                    // plus rien dire.
+                    resBuilder.setResolutionStrategy(
+                        ResolutionStrategy(
+                            kLockstepAnalysisSize,
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                        ),
+                    )
+                }
+                val resolution = resBuilder.build()
+                // En lockstep, la caméra n'est PAS liée à un aperçu : c'est le
+                // flux d'analyse lui-même qui est affiché, une fois sa
+                // détection terminée. Un cas d'usage en moins pour le capteur,
+                // et surtout plus aucune hypothèse sur la façon dont
+                // PreviewView recadre son image.
+                val preview = previewView?.let { pv ->
+                    Preview.Builder()
+                        .setResolutionSelector(resolution)
+                        .build()
+                        .also { it.setSurfaceProvider(pv.surfaceProvider) }
+                }
                 val analysis = ImageAnalysis.Builder()
                     .setResolutionSelector(resolution)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -1912,18 +2872,18 @@ class NativeArView(
                     .build()
                     .also { it.setAnalyzer(analysisExecutor, ::analyze) }
                 provider.unbindAll()
+                val useCases = listOfNotNull(preview, analysis).toTypedArray()
                 val camera = provider.bindToLifecycle(
                     activity as LifecycleOwner,
                     CameraSelector.DEFAULT_FRONT_CAMERA,
-                    preview,
-                    analysis,
+                    *useCases,
                 )
                 readCameraFov(camera.cameraInfo)
                 // Les deux résolutions DOIVENT avoir le même rapport d'aspect :
                 // c'est l'hypothèse sur laquelle repose toute la conversion
                 // landmark → écran. Journalisé pour pouvoir le vérifier au
                 // lieu de l'espérer.
-                val pr = preview.resolutionInfo?.resolution
+                val pr = preview?.resolutionInfo?.resolution
                 val ar = analysis.resolutionInfo?.resolution
                 val pa = pr?.let { it.width.toFloat() / it.height }
                 val aa = ar?.let { it.width.toFloat() / it.height }
@@ -1988,12 +2948,19 @@ class NativeArView(
             frameRotation = image.imageInfo.rotationDegrees
             frameW = image.width
             frameH = image.height
+            // L'horodatage est établi AVANT tout le reste : c'est la clé qui
+            // relie la frame, son résultat de détection et son affichage.
+            val ts = SystemClock.uptimeMillis()
             val bitmap = image.toBitmap()
+            // Conservée pour l'affichage lockstep : elle ne sera montrée que
+            // lorsque SA détection aboutira (cf. publishFrame).
+            // Le flux optique a besoin de l'image, lui aussi : c'est le même
+            // anneau qui la lui fournit.
+            if (lockstep || flowEnabled) storeFrame(ts, bitmap)
             val mpImage = BitmapImageBuilder(bitmap).build()
             val opts = ImageProcessingOptions.builder()
                 .setRotationDegrees(image.imageInfo.rotationDegrees)
                 .build()
-            val ts = SystemClock.uptimeMillis()
             lm?.detectAsync(mpImage, opts, ts)
             // Collier : la pose est le détecteur principal → chaque frame.
             // Manchette : une frame sur deux suffit (l'avant-bras bouge moins
@@ -2115,6 +3082,7 @@ class NativeArView(
         auxProviders += provider
         auxLoaders += loader
         auxResourceLoaders += resourceLoader
+        auxAssets += asset
         Log.i(
             TAG,
             "$label chargé : ${asset.entities.size} entités, " +
@@ -2205,7 +3173,42 @@ class NativeArView(
 
     override fun getView(): View = root
 
+    /** Relâche les MaterialInstance des assets auxiliaires (occluseur/ombre)
+     *  UNE seule fois, pendant que le moteur Filament vit encore. Appelé soit
+     *  par notre listener de détachement (le cas normal, AVANT le destroy du
+     *  ModelViewer), soit par dispose() en repli. On ne détruit QUE les
+     *  instances (destroyAsset) : les matériaux seront nettoyés par
+     *  Engine.destroy — les détruire ici aussi ferait un double-free. */
+    private fun destroyAuxAssetsOnce(reason: String) {
+        if (auxDestroyed) return
+        auxDestroyed = true
+        // Coupe le rendu de CETTE instance : plus aucune frame ne référencera
+        // les entités qu'on s'apprête à détruire.
+        choreographer.removeFrameCallback(frameCallback)
+        Log.i(
+            TAG,
+            "CYCLE ► #$instanceId destruction de ${auxAssets.size} asset(s) " +
+                "auxiliaire(s) [$reason]…",
+        )
+        try {
+            for (i in auxAssets.indices) {
+                auxLoaders.getOrNull(i)?.destroyAsset(auxAssets[i])
+            }
+            Log.i(TAG, "CYCLE ► #$instanceId assets auxiliaires détruits OK [$reason]")
+        } catch (e: Exception) {
+            Log.w(TAG, "CYCLE ► #$instanceId nettoyage des assets auxiliaires ÉCHOUÉ", e)
+        }
+        auxAssets.clear()
+    }
+
     override fun dispose() {
+        val ageMs = SystemClock.uptimeMillis() - createdAtMs
+        Log.w(
+            TAG,
+            "CYCLE ► instance #$instanceId DISPOSE appelé après ${ageMs}ms de vie " +
+                "(si c'est quelques centaines de ms → RECRÉATION de la vue, pas " +
+                "une sortie volontaire)",
+        )
         choreographer.removeFrameCallback(frameCallback)
         // Libère la caméra AVANT de couper l'analyse : sinon l'ImageReader
         // continue de produire des frames jamais fermées (maxImages acquired)
@@ -2217,10 +3220,24 @@ class NativeArView(
         handLandmarker = null
         poseLandmarker?.close()
         poseLandmarker = null
-        // NE PAS détruire les objets gltfio auxiliaires : Filament panique
-        // (SIGABRT « destroying material ... instances still alive ») car le
-        // moteur du ModelViewer vit encore. Fuite assumée, comme pour le
-        // ModelViewer lui-même (l'écran suivant recrée tout).
+        // DESTRUCTION DES ASSETS AUXILIAIRES — impérative, et AVANT tout le
+        // reste, car le ModelViewer (filament-utils) enregistre son propre
+        // listener de détachement qui appelle destroy()→Engine.destroy() dès
+        // que la SurfaceView quitte la fenêtre. Flutter appelle notre dispose()
+        // juste avant ce retrait de vue : c'est notre seule fenêtre pour
+        // relâcher les MaterialInstance de l'occluseur/ombre pendant que le
+        // moteur vit encore. Sans ça, Engine.destroy trouve une instance
+        // base_lit_opaque vivante et panique (SIGABRT observé en quittant
+        // l'écran). On ne détruit QUE les instances (destroyAsset) : les
+        // matériaux eux-mêmes seront nettoyés par Engine.destroy, les détruire
+        // ici aussi ferait un double-free.
+        destroyAuxAssetsOnce("dispose")
+        // Frames retenues pour le lockstep : quelques mégaoctets qui n'ont
+        // plus de raison d'être. On ne les recycle PAS (le thread UI peut
+        // encore être en train d'en dessiner une) — on lâche les références,
+        // le ramasse-miettes fera le reste au bon moment.
+        shownFrame = null
+        synchronized(frameLock) { frameBmp.fill(null) }
         occAsset = null
         shadowAsset = null
         auxResourceLoaders.clear()
@@ -2236,6 +3253,9 @@ class NativeArView(
 
     companion object {
         private const val TAG = "NativeArView"
+        /** Nombre de NativeArView construites depuis le lancement (trace du
+         *  cycle de vie / des recréations de PlatformView, cf. instanceId). */
+        private var instanceCounter = 0
         private const val MODEL_ASSET = "hand_landmarker.task"
         private const val POSE_MODEL_ASSET = "pose_landmarker_lite.task"
 
@@ -2246,14 +3266,88 @@ class NativeArView(
          *  main pour accepter la détection de pose. */
         private const val kPoseMaxWristDistSq = 0.25f * 0.25f
 
-        /** Cohérence min (cosinus) entre axe pose et axe main : en dessous
-         *  (>~60° d'écart), l'axe pose est rejeté au profit de l'axe main. */
-        private const val kPoseCoherenceDot = 0.5f
+        /** Seuils de Schmitt sur la cohérence (cosinus) entre axe pose et axe
+         *  main. On ADOPTE la pose à ~25° d'écart, on ne l'ABANDONNE qu'à
+         *  ~45°. L'ancien seuil unique de 0.5 (60°) laissait la source osciller
+         *  dès que la cohérence flottait autour de la limite — et chaque
+         *  oscillation faisait pivoter le bijou d'un bloc. */
+        private const val kPoseEnterDot = 0.90f
+        private const val kPoseExitDot = 0.70f
 
-        /** Confiance minimale publiée par le modèle de pose pour accepter un
-         *  landmark. En dessous, l'articulation est hors cadre et sa position
-         *  est INVENTÉE — le modèle renvoie toujours ses 33 points. */
-        private const val kPoseMinVisibility = 0.6f
+        /** Frames contraires consécutives avant de changer de source d'axe. */
+        private const val kSourceVotesToFlip = 6
+
+        /** Frames contraires consécutives avant de rouvrir une convention de
+         *  repère, et écart de score minimal pour qu'une frame ait voix au
+         *  chapitre. Généreux : ces conventions ne changent pas en cours de
+         *  session, une bascule est presque toujours du bruit. */
+        private const val kConventionVotes = 10
+        private const val kConventionMargin = 0.15f
+
+        /** Nombre de mesures accumulées avant de FIGER la morphologie.
+         *
+         *  Le masque n'aboutit pas à toutes les frames et la pose ne tourne
+         *  qu'une frame d'analyse sur deux : ~40 mesures représentent quelques
+         *  secondes de cadrage correct — assez pour que la médiane soit
+         *  robuste, assez peu pour que l'utilisateur n'attende pas. */
+        /** Frames d'analyse gardées en attente de leur détection (mode
+         *  lockstep).
+         *
+         *  Doit couvrir la latence du pipeline exprimée en FRAMES : à 30 Hz et
+         *  ~150 ms, trois à quatre frames sont stockées entre la soumission
+         *  d'une image et le retour de sa détection. Trop court, l'image
+         *  cherchée a déjà été écrasée et l'affichage saute la frame — soit
+         *  précisément le hoquet qu'on veut supprimer. Six laisse une marge
+         *  pour les pics de charge, au prix de ~29 Mo à 1280×960. */
+        private const val kFrameRing = 6
+
+        /** Résolution d'analyse demandée en lockstep (cf. startCamera). C'est
+         *  LE curseur netteté ⇄ coût : la baisser adoucit l'image, la monter
+         *  alourdit la conversion bitmap et le transfert GPU (mais pas
+         *  l'inférence). Rapport 4:3 obligatoire, comme le reste du pipeline. */
+        private val kLockstepAnalysisSize = Size(1280, 960)
+
+        /** Côté de la fenêtre extraite pour le flux optique (pixels image).
+         *  Doit contenir la grille de points suivis et leurs fenêtres de
+         *  corrélation, plus la marge du déplacement inter-frame. */
+        private const val kFlowWin = 96
+
+        /** Gain de correction vers la mesure du réseau, par frame.
+         *
+         *  C'est LE curseur du filtre complémentaire. Bas = on fait confiance
+         *  au flux (fluide, mais la dérive met du temps à être rattrapée) ;
+         *  haut = on revient vite au réseau, en réimportant son bruit. 0.15
+         *  rattrape un écart en ~6 frames (~0,2 s) : assez lent pour filtrer le
+         *  tremblement de la régression, assez vif pour qu'aucune dérive du
+         *  flux ne devienne visible. */
+        private const val kFlowCorrect = 0.15f
+
+        private const val kLockSamples = 40
+
+        /** Écart au-delà duquel une mesure CONTREDIT la morphologie figée.
+         *  1.35 est très au-dessus du bruit de mesure ordinaire (le garde-fou
+         *  de vraisemblance accepte déjà 0.60–1.70 autour de l'anatomique) :
+         *  seul un verrouillage réellement raté peut le franchir durablement. */
+        private const val kRelockRatio = 1.35f
+
+        /** Confiance minimale publiée par le modèle de pose pour accepter le
+         *  poignet/coude. Abaissée de 0.6 à 0.35 d'après les LOGS DEVICE : dans
+         *  le cadrage réel d'essayage (bras levé, main proche du visage), la
+         *  pose publie une confiance de 0.22–0.56 pour le poignet — pourtant le
+         *  bras est bien visible. À 0.6, la quasi-totalité des frames étaient
+         *  rejetées → aucun axe d'avant-bras, aucun balayage de silhouette, donc
+         *  la taille retombait sur l'estimation main (instable) : c'est LA cause
+         *  de l'effondrement observé. À 0.35 on n'écarte plus que les
+         *  articulations franchement inventées, et le pipeline silhouette reçoit
+         *  enfin des données. L'axe garde ses garde-fous en aval (arbitrage
+         *  pose/main à hystérésis, roulis contraint par la silhouette). */
+        private const val kPoseMinVisibility = 0.35f
+
+        /** Seuil de visibilité des épaules pour le collier. Bien plus bas que
+         *  celui du bras : le collier n'a pas de détecteur de secours, donc on
+         *  ne rejette que les épaules quasi certainement inventées, et on laisse
+         *  le lissage renforcé absorber le reste (cf. onPoseNeck). */
+        private const val kNeckMinVisibility = 0.3f
 
         /** Longueur planaire minimale coude→poignet (écran normalisé) pour
          *  tirer une direction. En dessous, les deux points se superposent en
@@ -2266,8 +3360,15 @@ class NativeArView(
         private const val kScaleMaxRatio = 1.5f
 
         /** Vitesse de convergence de l'échelle lissée (fraction par frame,
-         *  ~60 fps → converge en ~0,5 s, insensible au bruit de mesure). */
+         *  ~60 fps → converge en ~0,5 s, insensible au bruit de mesure).
+         *  N'agit plus qu'AVANT le verrouillage de la morphologie, pendant que
+         *  l'estimation est encore bruitée. */
         private const val kScaleLerp = 0.06f
+
+        /** Après verrouillage, l'échelle ne varie plus que par la distance :
+         *  c'est un signal réel, qu'il faut suivre vite (~0,15 s) sous peine
+         *  de voir le bijou grandir en retard sur la main qui approche. */
+        private const val kScaleLerpLocked = 0.25f
 
         // --- Calibration (à ajuster visuellement) ---
         /** Distance caméra→modèle (cohérente avec orbitHomePosition). */
@@ -2330,9 +3431,15 @@ class NativeArView(
         private const val kWristWidthPerHand = 0.70f
 
         /** Jeu du bracelet : Ø intérieur = kBraceletClearance × largeur du
-         *  bras MESURÉE. 1.12 = bracelet ajusté qui prend exactement la
-         *  taille du bras, avec juste le jeu d'un bijou rigide réel. */
-        private const val kBraceletClearance = 1.12f
+         *  bras MESURÉE (silhouette du masque de segmentation).
+         *
+         *  Ramené de 1.12 à 1.06 : à 12 %, le tube intérieur passait ~12 % au-
+         *  delà du bord réel de l'avant-bras → un vide visible tout autour, le
+         *  « diamètre mal ajusté » signalé. La largeur venant du masque EST déjà
+         *  le bord du bras : 6 % suffisent pour le jeu d'un bijou rigide sans
+         *  flotter. Doit rester > kOccluderMargin (1.05) pour que le cylindre
+         *  occluseur reste à l'intérieur du trou. */
+        private const val kBraceletClearance = 1.06f
 
         /** Fraîcheur max de la mesure silhouette avant repli anatomique. */
         private const val kSegFreshMs = 400L
@@ -2352,8 +3459,15 @@ class NativeArView(
         private const val kFingerPitchMax = 0.35f
 
         /** Jeu de la bague autour du doigt : une bague est ajustée, bien plus
-         *  qu'une manchette — elle doit tenir sans tomber. */
-        private const val kRingClearance = 1.06f
+         *  qu'une manchette — elle doit tenir sans tomber.
+         *
+         *  Ramené de 1.06 à 1.02 : le rayon du doigt est déduit de la moitié du
+         *  PITCH entre MCP voisins (fingerRadiusMetric), qui vaut la largeur du
+         *  doigt au KNUCKLE — le point le plus large — alors que la bague se
+         *  pose plus haut sur la phalange, plus fine. Cette surestimation se
+         *  cumulait avec les 6 % de jeu : l'anneau sortait « un peu grand ».
+         *  1.02 = juste le jeu d'un anneau rigide qui glisse sur le doigt. */
+        private const val kRingClearance = 1.02f
 
         /** Position de la bague le long de la phalange proximale, en fraction
          *  de MCP (lm13) → PIP (lm14). 0 = sur l'articulation, 1 = à la
@@ -2365,6 +3479,15 @@ class NativeArView(
          *  manchette (proche) et l'évasement de l'avant-bras (loin). */
         private const val kScanNear = 0.10f
         private const val kScanFar = 0.45f
+
+        /** Balayage pour trouver le POIGNET = point le plus étroit du bras
+         *  entre la main (~0) et le milieu de l'avant-bras. On garde la largeur
+         *  minimale sur cette plage (même principe que le cou). Robuste à la
+         *  main ouverte : un échantillon tombé sur la paume est plus large,
+         *  donc écarté d'office. */
+        private const val kWristScanFrom = 0.04f
+        private const val kWristScanTo = 0.34f
+        private const val kWristScanStep = 0.06f
 
         /** Écart min (unités monde) entre les deux points de mesure projetés
          *  sur l'axe pour en tirer une pente : en dessous, le bras pointe
@@ -2387,8 +3510,12 @@ class NativeArView(
         private const val kBandHalfHeight = 0.923f
 
         /** Marge (fraction de s) entre le pli du poignet et le bord
-         *  supérieur de la manchette. */
-        private const val kBandGap = 0.05f
+         *  supérieur de la manchette. Ramenée de 0.05 à 0 : le bord supérieur
+         *  affleure alors exactement le landmark poignet (lm0), qui tombe au
+         *  pli — « la limite de la manchette à la limite de la main ». Le reste
+         *  de la hauteur ressentie vient de la proportion RÉELLE de la pièce
+         *  (manchette large : ~2.4× le rayon du poignet), pas d'un décalage. */
+        private const val kBandGap = 0.0f
 
         // --- Collier (plastron) ---
         // Constantes MESURÉES sur assets/jewelry/colliers/collier.glb
@@ -2416,6 +3543,18 @@ class NativeArView(
          *  la largeur d'épaules : vise le creux sternal plutôt que la ligne
          *  acromiale, qui est un peu basse. */
         private const val kNeckRise = 0.08f
+
+        /** Écart minimal bouche→épaules (en demi-visages oreilles→bouche) pour
+         *  juger les épaules CRÉDIBLES. Une épaule réelle est bien plus bas
+         *  qu'un demi-visage sous la bouche ; si la pose la place plus haut,
+         *  elle l'a inventée (cadrage serré) → on bascule sur le repli visage.
+         *  1.0 = permissif : on n'écarte que les épaules franchement au visage. */
+        private const val kNeckShoulderGap = 1.0f
+
+        /** Repli VISAGE : distance bouche→base du cou, en demi-visages
+         *  (oreilles→bouche). ~1.6 place l'encolure sous le menton, au bas du
+         *  cou. À affiner à l'œil avec le log `cou:` (source=VISAGE). */
+        private const val kFaceToNeck = 1.6f
 
         /** Profondeur du cou / largeur (section légèrement aplatie). */
         private const val kNeckDepthRatio = 0.85f
@@ -2452,10 +3591,13 @@ class NativeArView(
          *  le centre mesuré de la silhouette. */
         private const val kSegOffsetLerp = 0.12f
 
-        /** 0.08 laissait le bijou glisser latéralement de 8 % de l'écran (~90 px
-         *  sur une dalle 1080) au gré du bruit du masque. Le recentrage doit
-         *  corriger un biais de landmark, pas déplacer la pièce. */
-        private const val kSegOffsetMax = 0.04f
+        /** Amplitude max du recentrage latéral sur le centre mesuré de la
+         *  silhouette. Relevée de 0.04 à 0.09 : une fois l'échelle refondée sur
+         *  la silhouette (source fiable), on peut faire confiance à son CENTRE
+         *  pour corriger un vrai décalage visible (le bord du bijou sortait du
+         *  bras sur les captures), pas seulement un micro-biais de landmark. Le
+         *  lissage kSegOffsetLerp l'empêche de sauter. */
+        private const val kSegOffsetMax = 0.09f
 
         /** Marge de l'occluseur au-delà du rayon estimé du poignet : absorbe
          *  l'erreur d'estimation pour que l'arrière de l'anneau ne
@@ -2484,11 +3626,6 @@ class NativeArView(
          *  la mesure est quasi colinéaire à l'axe → direction indéterminée. */
         private const val kMinRollNorm = 0.05f
 
-        /** Lissage du roulis mesuré (fraction/frame) : le masque n'est
-         *  ré-évalué qu'une frame d'analyse sur deux, la boucle de rendu
-         *  tourne à 60 fps → convergence douce, sans à-coups d'orientation. */
-        private const val kRollLerp = 0.10f
-
         /** Sous cette fraction "dans le plan écran" de l'axe, on arrête de
          *  compenser le raccourcissement de perspective (protège des
          *  divisions extrêmes quand le membre pointe vers la caméra). */
@@ -2511,19 +3648,21 @@ class NativeArView(
         private const val kPriorityJewel = 4
         private const val kPriorityShadow = 7
 
+        /** Ombre de contact (jupe noire au sol du bijou). Coupée : sa moitié
+         *  avant restait visible comme un halo sombre sur la peau. Repasser à
+         *  true pour la rétablir si un occluseur plus fin la retranche mieux. */
+        private const val kContactShadowEnabled = false
+
         /** Longueur des occluseurs : traversent largement le bijou le long du
          *  membre (le rayon, lui, vient désormais du fit.json). */
         private const val kWristOccLen = 4.0f
         private const val kRingOccLen = 7.0f
 
-        /** Avance temporelle (s) de la compensation de latence.
-         *
-         *  L'extrapolation échange du RETARD contre de la GIGUE : elle ajoute
-         *  vitesse×avance à la position, or la vitesse est l'estimation la
-         *  plus bruitée d'un filtre One-Euro. 0.09 s était réglé pour masquer
-         *  la latence d'un pipeline qui tournait mal ; maintenant que la pose
-         *  est sur GPU, mieux vaut un léger retard qu'un bijou qui vibre. */
-        private const val kLeadSeconds = 0.05f
+        /** Âge maximal pris en compte pour extrapoler un instantané de suivi
+         *  (s). Au-delà, la détection a franchement décroché : continuer à
+         *  avancer sur la dernière vitesse connue projetterait le bijou loin
+         *  de la main. On gèle alors plutôt que d'inventer. */
+        private const val kMaxLatencySec = 0.30f
 
         /** Déplacement prédictif max (unités normalisées).
          *
@@ -2549,6 +3688,454 @@ class NativeArView(
             0f, 0f, 0f, 0f,
             0f, 0f, 10f, 1f,
         )
+    }
+}
+
+/**
+ * Grandeur physiquement CONSTANTE : mesurée sur les premières frames fiables,
+ * puis figée pour le reste de la session.
+ *
+ * Le rayon du poignet, du doigt ou du cou de l'utilisateur ne change pas
+ * pendant un essayage. Les ré-estimer à chaque frame ne rendait donc pas le
+ * suivi plus juste — seulement plus instable, puisque chaque frame apportait un
+ * bruit de mesure différent et que les sources de repli ne s'accordaient pas
+ * entre elles. C'est ce va-et-vient qui se lisait à l'écran comme un bijou qui
+ * « respire » et change de taille au moindre mouvement.
+ *
+ * Deux propriétés font le travail :
+ *  - la MÉDIANE (et non la moyenne) ignore les relevés aberrants, ceux que le
+ *    balayage du masque produit quand il fuit dans le torse ou l'autre bras ;
+ *  - le VERROUILLAGE garantit qu'une fois la morphologie établie, plus aucune
+ *    mesure ultérieure ne peut la déplacer.
+ *
+ * Avant d'être plein, l'objet renvoie la médiane courante : la valeur se
+ * stabilise progressivement au lieu de sauter d'une mesure à l'autre.
+ *
+ * Les valeurs offertes doivent être en MÈTRES, c'est-à-dire indépendantes de la
+ * distance à la caméra — sans quoi on figerait une taille apparente, et le
+ * bijou cesserait de grossir quand la main approche.
+ */
+/**
+ * Suivi par FLUX OPTIQUE (Lucas-Kanade) du déplacement de l'ancre entre deux
+ * frames consécutives.
+ *
+ * ## Pourquoi
+ *
+ * Chaque détection MediaPipe est une régression INDÉPENDANTE : son erreur est
+ * ré-tirée à chaque frame (±1-2 %), sans corrélation avec la précédente. Le
+ * seul moyen d'en réduire le tremblement est de moyenner dans le temps — ce
+ * que fait le One-Euro — et moyenner dans le temps, c'est du RETARD. Tout le
+ * réglage jusqu'ici consistait à choisir où placer le curseur entre « ça
+ * tremble » et « ça traîne ».
+ *
+ * Le flux optique casse ce compromis, parce qu'il mesure autre chose : le
+ * déplacement RÉEL des pixels d'une frame à la suivante, à ~0,1 px près. Il
+ * dérive sur la durée (les petites erreurs s'accumulent) mais il est
+ * remarquablement précis à court terme — exactement l'inverse du réseau, précis
+ * à long terme et bruité à court terme. Les fusionner donne les deux :
+ * l'immédiateté du flux, l'ancrage sans dérive du réseau.
+ *
+ * C'est le pipeline décrit par les brevets WANNA (US 11,900,559 / 11,978,174),
+ * le prestataire d'essayage de Farfetch : réseau par frame, flux optique comme
+ * « motion cue », fusion par filtre de suivi rigide.
+ *
+ * ## Comment, à moindre coût
+ *
+ * Un Lucas-Kanade classique exige une pyramide d'images pour rattraper les
+ * grands déplacements — une main peut bouger de 30 px entre deux frames, très
+ * au-delà de ce qu'une fenêtre de recherche encaisse. On s'en dispense en
+ * AMORÇANT la recherche avec le déplacement que MediaPipe annonce lui-même : il
+ * ne reste alors à mesurer que son ERREUR, de quelques pixels. Un seul niveau
+ * suffit, et c'est justement cette erreur qu'on veut connaître.
+ *
+ * Le coût est borné de la même façon : on n'extrait qu'une fenêtre autour de
+ * l'ancre (quelques milliers de pixels) au lieu de convertir l'image entière.
+ */
+private class FlowTracker(private val win: Int, private val half: Int) {
+
+    private var prevGray: FloatArray? = null
+    private var prevOx = 0
+    private var prevOy = 0
+
+    /** Ancre de la frame précédente, en pixels image : origine des points
+     *  suivis ET référence de l'amorce (cf. track). */
+    private var prevAx = 0f
+    private var prevAy = 0f
+    private var prevTs = -1L
+
+    /** Luminance bilinéaire à la position ([x], [y]) exprimée dans le repère
+     *  de la fenêtre. Renvoie NaN hors du domaine échantillonnable. */
+    private fun sample(g: FloatArray, x: Float, y: Float): Float {
+        if (x < 0f || y < 0f || x > win - 2f || y > win - 2f) return Float.NaN
+        val xi = x.toInt()
+        val yi = y.toInt()
+        val fx = x - xi
+        val fy = y - yi
+        val i = yi * win + xi
+        val a = g[i]
+        val b = g[i + 1]
+        val c = g[i + win]
+        val d = g[i + win + 1]
+        return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy
+    }
+
+    /** Affine le déplacement ([gx], [gy]) du point ([px], [py]) (repère IMAGE)
+     *  par itérations de Lucas-Kanade. Renvoie le déplacement affiné, ou null
+     *  si la fenêtre est mal conditionnée (zone uniforme : peau lisse, fond
+     *  neutre — aucune information de mouvement à en tirer). */
+    private fun refine(
+        prev: FloatArray,
+        cur: FloatArray,
+        curOx: Int,
+        curOy: Int,
+        px: Float,
+        py: Float,
+        gx: Float,
+        gy: Float,
+    ): FloatArray? {
+        // ([px], [py]) est la position du point dans la frame PRÉCÉDENTE ;
+        // on le cherche dans la courante en (px + d, py + d). Les deux
+        // fenêtres ont des origines différentes, chacune centrée sur l'ancre
+        // de SA frame — d'où deux conversions distinctes.
+        val ax = px - prevOx
+        val ay = py - prevOy
+        var dx = gx
+        var dy = gy
+
+        // Matrice des moments du gradient (constante : elle ne dépend que de
+        // la frame précédente) et son inverse.
+        var gxx = 0f
+        var gxy = 0f
+        var gyy = 0f
+        val r = kPatchRadius
+        var j = -r
+        while (j <= r) {
+            var i = -r
+            while (i <= r) {
+                val ix = (sample(prev, ax + i + 1, ay + j) -
+                    sample(prev, ax + i - 1, ay + j)) * 0.5f
+                val iy = (sample(prev, ax + i, ay + j + 1) -
+                    sample(prev, ax + i, ay + j - 1)) * 0.5f
+                if (!ix.isNaN() && !iy.isNaN()) {
+                    gxx += ix * ix
+                    gxy += ix * iy
+                    gyy += iy * iy
+                }
+                i++
+            }
+            j++
+        }
+        val det = gxx * gyy - gxy * gxy
+        // Seuil de conditionnement : sans texture, le système est singulier et
+        // sa solution serait du bruit amplifié. Mieux vaut renoncer.
+        if (det < kFlowMinDet) return null
+
+        var it = 0
+        while (it < kFlowIters) {
+            var bx = 0f
+            var by = 0f
+            val cx0 = px + dx - curOx
+            val cy0 = py + dy - curOy
+            var jj = -r
+            while (jj <= r) {
+                var ii = -r
+                while (ii <= r) {
+                    val p = sample(prev, ax + ii, ay + jj)
+                    val c = sample(cur, cx0 + ii, cy0 + jj)
+                    if (!p.isNaN() && !c.isNaN()) {
+                        val diff = p - c
+                        val ix = (sample(prev, ax + ii + 1, ay + jj) -
+                            sample(prev, ax + ii - 1, ay + jj)) * 0.5f
+                        val iy = (sample(prev, ax + ii, ay + jj + 1) -
+                            sample(prev, ax + ii, ay + jj - 1)) * 0.5f
+                        if (!ix.isNaN() && !iy.isNaN()) {
+                            bx += ix * diff
+                            by += iy * diff
+                        }
+                    }
+                    ii++
+                }
+                jj++
+            }
+            val sx = (gyy * bx - gxy * by) / det
+            val sy = (gxx * by - gxy * bx) / det
+            if (!sx.isFinite() || !sy.isFinite()) return null
+            dx += sx
+            dy += sy
+            if (abs(sx) + abs(sy) < kFlowEps) break
+            it++
+        }
+        // Un raffinement énorme signifie que la recherche a décroché sur un
+        // motif voisin plutôt que suivi le bon : on préfère ne rien dire.
+        if (hypot(dx - gx, dy - gy) > kFlowMaxCorrection) return null
+        return floatArrayOf(dx, dy)
+    }
+
+    /** Mesure le déplacement de la zone autour de ([cxImg], [cyImg]) entre la
+     *  frame précédente et [bmp], en amorçant avec ([guessDx], [guessDy]).
+     *
+     *  Renvoie le déplacement mesuré (pixels image), ou null quand il n'est pas
+     *  exploitable : première frame, frame non consécutive, zone sans texture,
+     *  ou trop peu de points d'accord. */
+    fun track(
+        bmp: Bitmap,
+        ts: Long,
+        cxImg: Float,
+        cyImg: Float,
+        expectPrevTs: Long,
+    ): FloatArray? {
+        // Fenêtre TOUJOURS centrée sur l'ancre de sa propre frame : c'est ce
+        // qui permet, au tour suivant, de retrouver sans ambiguïté où se
+        // trouvaient les points de la frame précédente.
+        val ox = cxImg.toInt() - half
+        val oy = cyImg.toInt() - half
+        val gray = grabGray(bmp, ox, oy) ?: run {
+            prevGray = null
+            prevTs = -1L
+            return null
+        }
+
+        val prev = prevGray
+        val usable = prev != null && prevTs == expectPrevTs && expectPrevTs >= 0L
+        var out: FloatArray? = null
+        if (usable) {
+            // Amorce : le déplacement de l'ancre annoncé par le réseau, en
+            // pixels IMAGE. Le déduire des deux ancres successives dans CE
+            // repère est le seul calcul sûr — passer par l'espace d'affichage
+            // mélangerait rotation et miroir, et l'amorce partirait de travers.
+            val guessDx = cxImg - prevAx
+            val guessDy = cyImg - prevAy
+            // Plusieurs points répartis autour de l'ancre : une seule mesure
+            // serait à la merci d'un reflet ou d'une occlusion locale. On garde
+            // la MÉDIANE, insensible aux points qui ont décroché.
+            val dxs = ArrayList<Float>(kFlowPoints * kFlowPoints)
+            val dys = ArrayList<Float>(kFlowPoints * kFlowPoints)
+            val step = kFlowSpread
+            var gy = -(kFlowPoints / 2)
+            while (gy <= kFlowPoints / 2) {
+                var gx = -(kFlowPoints / 2)
+                while (gx <= kFlowPoints / 2) {
+                    // Points définis autour de l'ancre PRÉCÉDENTE : ce sont
+                    // eux qu'on retrouve dans la frame courante.
+                    val d = refine(
+                        prev!!, gray, ox, oy,
+                        prevAx + gx * step, prevAy + gy * step,
+                        guessDx, guessDy,
+                    )
+                    if (d != null) {
+                        dxs.add(d[0])
+                        dys.add(d[1])
+                    }
+                    gx++
+                }
+                gy++
+            }
+            if (dxs.size >= kFlowMinPoints) {
+                dxs.sort()
+                dys.sort()
+                out = floatArrayOf(dxs[dxs.size / 2], dys[dys.size / 2])
+            }
+        }
+
+        prevGray = gray
+        prevOx = ox
+        prevOy = oy
+        prevAx = cxImg
+        prevAy = cyImg
+        prevTs = ts
+        return out
+    }
+
+    fun reset() {
+        prevGray = null
+        prevTs = -1L
+    }
+
+    /** Extrait une fenêtre carrée en luminance. null si elle sort de l'image :
+     *  compléter par des bords inventés ferait mesurer un mouvement qui
+     *  n'existe pas. */
+    private fun grabGray(bmp: Bitmap, ox: Int, oy: Int): FloatArray? {
+        if (ox < 0 || oy < 0 || ox + win > bmp.width || oy + win > bmp.height) return null
+        val px = IntArray(win * win)
+        bmp.getPixels(px, 0, win, ox, oy, win, win)
+        val g = FloatArray(win * win)
+        for (i in px.indices) {
+            val p = px[i]
+            // Luminance perceptuelle en entiers : les coefficients Rec. 601
+            // mis à l'échelle 1024 évitent tout flottant dans la boucle chaude.
+            g[i] = (
+                306 * ((p shr 16) and 0xFF) +
+                    601 * ((p shr 8) and 0xFF) +
+                    117 * (p and 0xFF)
+                ) / 1024f
+        }
+        return g
+    }
+
+    companion object {
+        /** Demi-côté de la fenêtre de corrélation d'UN point. */
+        private const val kPatchRadius = 6
+
+        /** Itérations de Newton par point. La correction cherchée ne vaut que
+         *  quelques pixels (recherche amorcée), elle converge en 3-4 pas. */
+        private const val kFlowIters = 4
+
+        /** Sous ce déterminant, la fenêtre est trop uniforme pour porter une
+         *  information de mouvement (peau lisse, mur neutre). */
+        private const val kFlowMinDet = 1e4f
+
+        /** Arrêt anticipé quand le pas devient négligeable (pixels). */
+        private const val kFlowEps = 0.03f
+
+        /** Correction max acceptée par rapport à l'amorce MediaPipe. Au-delà,
+         *  le point a suivi un motif voisin, pas le bon. */
+        private const val kFlowMaxCorrection = 12f
+
+        /** Grille de points suivis (kFlowPoints²) et leur écartement. */
+        private const val kFlowPoints = 3
+        private const val kFlowSpread = 14f
+
+        /** Points valides minimaux pour publier une médiane crédible. */
+        private const val kFlowMinPoints = 4
+    }
+}
+
+/**
+ * État de suivi publié par le thread de détection, DATÉ de la frame dont il
+ * est issu.
+ *
+ * Immuable, et publié d'un seul bloc via une référence @Volatile : la boucle de
+ * rendu ne peut donc jamais lire une position venant d'une détection et une
+ * vitesse venant de la suivante. Avec des champs séparés, ce mélange se produit
+ * — rarement, donc sous la forme d'un sursaut inexplicable et non reproductible.
+ *
+ * [frameTimeMs] est l'horodatage posé par `analyze` sur la frame analysée, pas
+ * la date de publication : c'est ce qui permet au rendu de connaître l'âge réel
+ * de la mesure (cf. anchorAt).
+ */
+private class TrackSnapshot(
+    val x: Float,
+    val y: Float,
+    val vx: Float,
+    val vy: Float,
+    val frameTimeMs: Long,
+)
+
+private class LockedMedian(
+    private val name: String,
+    private val samplesToLock: Int,
+    private val relockRatio: Float,
+) {
+    private val samples = ArrayList<Float>(samplesToLock)
+
+    /** Mesures consécutives en désaccord franc avec la valeur figée. */
+    private var dissent = 0
+
+    /** Médiane courante, ou -1 tant qu'aucune mesure n'a été offerte. */
+    var value = -1f
+        private set
+
+    /** true = la valeur ne bouge plus (sauf déverrouillage, cf. offer). */
+    var isLocked = false
+        private set
+
+    fun offer(x: Float) {
+        if (!x.isFinite() || x <= 0f) return
+
+        if (isLocked) {
+            // SOUPAPE. Figer définitivement serait un pari : si les premières
+            // secondes se passent mal (cadrage douteux, manche, mauvais bras),
+            // l'utilisateur resterait coincé avec une taille fausse pour toute
+            // la session — et sans aucun moyen de la corriger, ce qui est pire
+            // que l'instabilité qu'on cherche à supprimer.
+            //
+            // On ne rouvre donc que sur un désaccord FRANC et SOUTENU : autant
+            // de mesures consécutives qu'il en a fallu pour verrouiller. Le
+            // bruit ordinaire ne peut pas produire ça (il change de signe), une
+            // vraie erreur de verrouillage si.
+            val r = x / value
+            if (r < 1f / relockRatio || r > relockRatio) {
+                if (++dissent >= samplesToLock) {
+                    Log.w(
+                        "NativeArView",
+                        "morphologie: $name DÉVERROUILLÉ — $samplesToLock mesures " +
+                            "consécutives incohérentes avec $value (dernière : $x)",
+                    )
+                    isLocked = false
+                    dissent = 0
+                    value = -1f
+                    samples.clear()
+                }
+            } else {
+                dissent = 0
+            }
+            return
+        }
+
+        samples.add(x)
+        val sorted = samples.sorted()
+        value = sorted[sorted.size / 2]
+        if (samples.size >= samplesToLock) {
+            isLocked = true
+            samples.clear()
+            Log.i("NativeArView", "morphologie: $name VERROUILLÉ sur $value")
+        }
+    }
+}
+
+/**
+ * Choix binaire STABLE entre deux interprétations concurrentes.
+ *
+ * Plusieurs décisions du pipeline — convention de rotation des landmarks,
+ * espace du masque de segmentation, source de l'axe — portent sur des
+ * propriétés du DEVICE ou de la scène, qui ne changent pas d'une frame à
+ * l'autre. Le code les redécidait pourtant intégralement à chaque frame, à
+ * partir de scores bruités. Quand les deux candidats sont proches, le bruit du
+ * capteur suffit alors à faire osciller la décision — et comme les deux
+ * interprétations donnent des résultats très différents (repère tourné, largeur
+ * mesurée ailleurs), chaque oscillation est un SAUT du bijou. C'est très
+ * exactement le symptôme « ça bouge parfois sans aucun mouvement ».
+ *
+ * On accumule donc des voix : on ne change d'avis que sur une contradiction
+ * SOUTENUE, jamais sur une frame isolée.
+ */
+private class StickyChoice(
+    private val name: String,
+    private val votesToFlip: Int,
+) {
+    var value: Boolean? = null
+        private set
+
+    private var votes = 0
+
+    /** [candidate] = ce que déciderait un choix instantané. null = aucune
+     *  information exploitable cette frame — on conserve alors la valeur en
+     *  cours plutôt que de la détruire (un landmark hors masque ne prouve
+     *  rien sur la convention du masque). */
+    fun update(candidate: Boolean?): Boolean? {
+        if (candidate == null) return value
+        val current = value
+        if (current == null) {
+            value = candidate
+            votes = 0
+            Log.i("NativeArView", "convention $name verrouillée sur $candidate")
+            return candidate
+        }
+        if (candidate == current) {
+            votes = 0
+        } else if (++votes >= votesToFlip) {
+            value = candidate
+            votes = 0
+            // Journalisé en WARN : une bascule reste possible (changement
+            // d'orientation de l'appareil), mais elle est visible à l'écran.
+            // Si ce message défile, c'est que le seuil est encore trop bas.
+            Log.w(
+                "NativeArView",
+                "convention $name BASCULE vers $candidate " +
+                    "($votesToFlip frames contraires consécutives)",
+            )
+        }
+        return value
     }
 }
 
@@ -2685,6 +4272,58 @@ private class JewelFit(private val json: JSONObject) {
     fun radiusToward(axis: String): Float {
         val v = json.optDouble("radiusToward$axis", -1.0).toFloat()
         return if (v > 0f) v else holeRadiusMin
+    }
+}
+
+/**
+ * Filtre One-Euro appliqué à une ROTATION entière, via son quaternion.
+ *
+ * Lisser une orientation ne se fait pas composante par composante sur une
+ * matrice : le résultat n'est plus une rotation. Sur le quaternion unitaire, en
+ * revanche, un lissage composante par composante suivi d'une renormalisation
+ * reste une rotation valide — et pour les petits écarts entre frames (c'est
+ * toujours le cas à 30-60 Hz) il approche la slerp de très près, pour une
+ * fraction du coût.
+ *
+ * Le point délicat est le SIGNE : q et −q décrivent la même rotation, mais un
+ * changement de signe entre deux frames ferait interpoler par le grand arc,
+ * c'est-à-dire un tour complet du bijou sur une seule frame. On aligne donc
+ * chaque mesure sur la précédente (produit scalaire négatif → on retourne le
+ * quaternion) avant de filtrer.
+ */
+private class QuatFilter(minCutoff: Float, beta: Float) {
+    private val f = Array(4) { OneEuroFilter(minCutoff, beta) }
+    private var prev: FloatArray? = null
+
+    fun filter(q: FloatArray, tMs: Long): FloatArray {
+        var qq = q
+        val p = prev
+        if (p != null) {
+            val d = qq[0] * p[0] + qq[1] * p[1] + qq[2] * p[2] + qq[3] * p[3]
+            if (d < 0f) qq = floatArrayOf(-qq[0], -qq[1], -qq[2], -qq[3])
+        }
+        val o = floatArrayOf(
+            f[0].filter(qq[0], tMs),
+            f[1].filter(qq[1], tMs),
+            f[2].filter(qq[2], tMs),
+            f[3].filter(qq[3], tMs),
+        )
+        val n = sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2] + o[3] * o[3])
+        // Une norme quasi nulle signifie que les quatre passe-bas sont passés
+        // par zéro simultanément — pas de rotation exploitable, on garde la
+        // mesure brute plutôt que de diviser par presque rien.
+        val r = if (n < 1e-6f) {
+            qq
+        } else {
+            floatArrayOf(o[0] / n, o[1] / n, o[2] / n, o[3] / n)
+        }
+        prev = r
+        return r
+    }
+
+    fun reset() {
+        f.forEach { it.reset() }
+        prev = null
     }
 }
 
